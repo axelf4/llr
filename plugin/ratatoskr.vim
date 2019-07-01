@@ -198,38 +198,41 @@ function! Parse() abort
 	let input = map(str2list('((()))'), {k, v -> ToId(nr2char(v))}) " Input list of symbols
 	let cur = 0
 
-	let stack = []
-	while v:true
-		let s = get(stack, -1, 0)
-		let t = get(input, cur, eof)
+	let bos = -1 " Symbol for bottom of stack
+	let node = {'symbol': bos, 'state': 0}
 
+	while v:true
+		let s = node.state
+		let t = get(input, cur, eof)
 		call assert_false(IsNonTerminal(t))
 
 		let action = actions[s][t - num_non_terminals]
+
 		echomsg 'Doing action: ' . string(action)
 
 		if type(action) == v:t_string && action == 'error'
 			" Error
-			echomsg 'Error: stack: ' . string(stack)
+			echomsg 'Error: stack: ' . string(node)
 			throw 'Bad input'
 		elseif action.type == 'done'
-			if t == eof && len(stack) == 1
-				" Finished successfully
-				echomsg 'Success'
-				break
-			endif
+			" Finished successfully
+			echomsg 'Success: stack: ' . string(node)
+			break
 		elseif action.type == 'shift'
-			" call add(stack, t) " Shift the matched terminal t onto the parse stack
+			let node = {'symbol': t, 'state': action.next, 'predecessor': node}
 			let cur += 1 " Scan the next input symbol into the lookahead buffer
-			call add(stack, action.next) " Push next state n onto the parse stack as the new current state
 		elseif action.type == 'reduce'
 			let L = action.arity
-			call remove(stack, -L, -1) " Remove the matched topmost L symbols from the parse stack
-			" let p = stack[-1]
-			let p = get(stack, -1, 0)
-			echomsg 'p is ' . p . ' and lhs is ' . action.lhs
-			let n = goto[p][action.lhs]
-			call add(stack, n)
+			let new = {'symbol': action.lhs, 'children': []}
+			for i in range(L)
+				let child = node
+				let child.parent = new
+				call add(new.children, child)
+				let node = child.predecessor
+			endfor
+			let new.predecessor = node
+			let new.state = goto[node.state][action.lhs]
+			let node = new
 		endif
 	endwhile
 endfunction
