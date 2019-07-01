@@ -1,8 +1,16 @@
+" Incremental parser generator that compiles to VimL at runtime for
+" indentation, syntax highlighting, etc.
+"
+" Then use `listener_add()`
+"
+" Have to have great error recovery...
+"
 " See:
 " * https://pages.github-dev.cs.illinois.edu/cs421-haskell/web-su19/files/handouts/lr-parsing-tables.pdf
 " * https://dl.acm.org.sci-hub.tw/citation.cfm?id=357066
 
 " Action bit masks. super non optimal
+" TODO add accept/done
 let [shift, reduce, error] = [0x8000, 0x4000, 0x2000] | lockvar shift reduce error
 
 function! Parse() abort
@@ -43,8 +51,7 @@ function! Parse() abort
 	function! IsNonTerminal(symbol) abort closure
 		call assert_true(type(a:symbol) == v:t_number
 					\ && a:symbol >= 0 && a:symbol < next_id, 'Invalid symbol')
-		" Non-terminal symbols are given the smaller id:s
-		return a:symbol < num_non_terminals
+		return a:symbol < num_non_terminals " Non-terminal symbols are given the smaller id:s
 	endfunction
 
 	let item = {}
@@ -56,25 +63,25 @@ function! Parse() abort
 	endfunction
 
 	" Returns the closure of the specified item set
+	"
+	" Modifies the specifed list in-situ.
 	function! Closure(item_set) abort closure
-		let item_set = deepcopy(a:item_set)
 		let i = 0
-		while i < len(item_set)
-			let item = item_set[i]
+		while i < len(a:item_set)
+			let item = a:item_set[i]
 			" If the item set contains an item with the cursor just to the left of some non-terminal N
 			let N = get(item.production.rhs, item.cursor, -1)
 			if N != -1 && IsNonTerminal(N)
 				" Add to the item set all initial items for the N-productions of the grammar, recursively
 				for N_production in filter(copy(grammar), {k, v -> v.lhs == N})
 					let new_item = {'production': N_production, 'cursor': 0}
-					" echom 'new_item in closure: ' . string(new_item)
 					" Only add if unique
-					if index(item_set, new_item) == -1 | call add(item_set, new_item) | endif
+					if index(a:item_set, new_item) == -1 | call add(a:item_set, new_item) | endif
 				endfor
 			endif
 			let i += 1
 		endwhile
-		return item_set
+		return a:item_set
 	endfunction
 
 	" FOLLOW sets are only defined for single nonterminals. The definition is
@@ -100,10 +107,11 @@ function! Parse() abort
 		return result
 	endfunction
 
-	function! Goto(item_set, x) abort closure
-		return Closure(map(filter(deepcopy(a:item_set), {k, v -> get(v.production.rhs, v.cursor, -1) == a:x}),
-					\ {k, v -> extend(v, {'cursor': v.cursor + 1})}))
-	endfunction
+	" Returns Kernel(IS, X) = {A -> aX•b | A -> a•Xb in IS}
+	"
+	" Modifies the specified list in-situ.
+	let Kernel = {item_set, x -> map(filter(item_set, {k, v -> get(v.production.rhs, v.cursor, -1) == x}),
+				\ {k, v -> extend(v, {'cursor': v.cursor + 1})})}
 
 	" Create DFA
 
@@ -122,7 +130,7 @@ function! Parse() abort
 		for item in state
 			let x = get(item.production.rhs, item.cursor, -1)
 			if x != -1
-				let goto = Goto(state, x)
+				let goto = Closure(Kernel(deepcopy(state), x))
 				let n_prime = index(states, goto)
 				if n_prime == -1
 					let n_prime = len(states)
@@ -165,7 +173,7 @@ function! Parse() abort
 			" echomsg 'Reduction item: ' . string(item) . ', i is ' . i . ' and A is ' . A . ' FollowSet: ' . string(FollowSet(A)) . ' eof: ' . eof
 			for t in FollowSet(A)
 				if actions[i][t - num_non_terminals] == 'shift' | throw 'Ambiguous grammar' | endif
-				let actions[i][t - num_non_terminals] = {'type': 'reduce', 'lhs': A, 'num': len(item.production.rhs)}
+				let actions[i][t - num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
 			endfor
 
 			if A == 0
@@ -215,7 +223,7 @@ function! Parse() abort
 			let cur += 1 " Scan the next input symbol into the lookahead buffer
 			call add(stack, action.next) " Push next state n onto the parse stack as the new current state
 		elseif action.type == 'reduce'
-			let L = action.num
+			let L = action.arity
 			call remove(stack, -L, -1) " Remove the matched topmost L symbols from the parse stack
 			" let p = stack[-1]
 			let p = get(stack, -1, 0)
