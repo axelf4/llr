@@ -107,11 +107,11 @@ function! Parse() abort
 		return result
 	endfunction
 
-	" Returns Kernel(IS, X) = {A -> aX•b | A -> a•Xb in IS}
+	" Returns Goto(I, X) = Closure({A -> aX•b | A -> a•Xb in I})
 	"
 	" Modifies the specified list in-situ.
-	let Kernel = {item_set, x -> map(filter(item_set, {k, v -> get(v.production.rhs, v.cursor, -1) == x}),
-				\ {k, v -> extend(v, {'cursor': v.cursor + 1})})}
+	let Goto = {item_set, x -> Closure(map(filter(item_set, {k, v -> get(v.production.rhs, v.cursor, -1) == x}),
+				\ {k, v -> extend(v, {'cursor': v.cursor + 1})}))}
 
 	" Create DFA
 
@@ -130,7 +130,7 @@ function! Parse() abort
 		for item in state
 			let x = get(item.production.rhs, item.cursor, -1)
 			if x != -1
-				let goto = Closure(Kernel(deepcopy(state), x))
+				let goto = Goto(deepcopy(state), x)
 				let n_prime = index(states, goto)
 				if n_prime == -1
 					let n_prime = len(states)
@@ -152,7 +152,7 @@ function! Parse() abort
 	let i = 0
 	for state in states
 		call add(actions, map(range(len(terminals)), '"error"'))
-		call add(goto, map(range(next_id), 0))
+		call add(goto, map(range(next_id), -1))
 
 		for edge in edges[i]
 			echom edge
@@ -171,7 +171,8 @@ function! Parse() abort
 			if item.cursor != len(item.production.rhs) | continue | endif
 			let A = item.production.lhs
 			" echomsg 'Reduction item: ' . string(item) . ', i is ' . i . ' and A is ' . A . ' FollowSet: ' . string(FollowSet(A)) . ' eof: ' . eof
-			for t in FollowSet(A)
+			" for t in FollowSet(A)
+			for t in terminals
 				if actions[i][t - num_non_terminals] == 'shift' | throw 'Ambiguous grammar' | endif
 				let actions[i][t - num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
 			endfor
