@@ -1,7 +1,7 @@
 " Incremental parser generator that compiles to VimL at runtime for
 " indentation, syntax highlighting, etc.
 "
-" Then use `listener_add()`
+" Then use `listener_add()` and the autocmd events BufReadPost and BufUnload
 "
 " Have to have great error recovery...
 "
@@ -53,6 +53,7 @@ function! Parse() abort
 					\ && a:symbol >= 0 && a:symbol < next_id, 'Invalid symbol')
 		return a:symbol < num_non_terminals " Non-terminal symbols are given the smaller id:s
 	endfunction
+	let IsTerminal = {symbol -> !IsNonTerminal(symbol)}
 
 	let item = {}
 	function! item.new(production, cursor) dict
@@ -100,7 +101,7 @@ function! Parse() abort
 				let idx = index(production.rhs, a:A, start)
 				if idx == -1 | break | endif
 				let t = get(production.rhs, idx + 1, eof)
-				if !IsNonTerminal(t) | call add(result, t) | endif
+				if IsTerminal(t) | call add(result, t) | endif
 				let start = idx + 1
 			endwhile
 		endfor
@@ -116,10 +117,8 @@ function! Parse() abort
 	" Create DFA
 
 	" Augment grammar with a production S' -> S, where S is the start symbol
-	" To generate the first item set, take the closure of the item S' -> *S
-	let initial_item_set = filter(Closure([{'production': {'lhs': -1, 'rhs': [ToId('S')]}, 'cursor': 0}]),
-				\ {k, v -> v.production.lhs != -1})
-	" let initial_item_set = Closure([{'production': {'lhs': -1, 'rhs': [ToId('S')]}, 'cursor': 0}])
+	" To generate the first item set, take the closure of the item S' -> •S
+	let initial_item_set = Closure([{'production': {'lhs': -1, 'rhs': [ToId('S')]}, 'cursor': 0}])
 	echomsg 'Initial item set: ' . string(initial_item_set)
 	let states = [initial_item_set] " Map from state index to associated closure
 	let edges = []
@@ -172,13 +171,15 @@ function! Parse() abort
 			let A = item.production.lhs
 			" echomsg 'Reduction item: ' . string(item) . ', i is ' . i . ' and A is ' . A . ' FollowSet: ' . string(FollowSet(A)) . ' eof: ' . eof
 			" for t in FollowSet(A)
-			for t in terminals
-				if actions[i][t - num_non_terminals] == 'shift' | throw 'Ambiguous grammar' | endif
-				let actions[i][t - num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
-			endfor
-
-			if A == 0
-				let actions[i][eof - num_non_terminals] = {'type': 'done'}
+			if A != -1
+				for t in terminals
+					if actions[i][t - num_non_terminals] == 'shift' | throw 'Ambiguous grammar' | endif
+					let actions[i][t - num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
+				endfor
+			else
+				if item == {'production': {'lhs': -1, 'rhs': [ToId('S')]}, 'cursor': 1}
+					let actions[i][eof - num_non_terminals] = {'type': 'done'}
+				endif
 			endif
 		endfor
 
@@ -196,16 +197,29 @@ function! Parse() abort
 		echomsg '' . n . ' | ' . string(goto[n])
 	endfor
 
-	let input = map(str2list('((()))'), {k, v -> ToId(nr2char(v))}) " Input list of symbols
-	let cur = 0
+	let lexer = {}
+	function lexer.new(input) closure
+		let new = copy(self)
+		" Input list of symbols
+		let new.input = map(str2list(a:input), {k, v -> ToId(nr2char(v))})
+		let new.cur = 0
+		return new
+	endfunction
+	function lexer.advance() closure
+		let symbol = get(self.input, self.cur, eof)
+		let col = self.cur
+		let self.cur += 1
+		return [symbol, col]
+	endfunction
 
+	let lex = lexer.new('((()))')
 	let bos = -1 " Symbol for bottom of stack
 	let node = {'symbol': bos, 'state': 0}
+	let [t, col] = lex.advance()
 
 	while v:true
 		let s = node.state
-		let t = get(input, cur, eof)
-		call assert_false(IsNonTerminal(t))
+		call assert_true(IsTerminal(t))
 
 		let action = actions[s][t - num_non_terminals]
 
@@ -220,21 +234,72 @@ function! Parse() abort
 			echomsg 'Success: stack: ' . string(node)
 			break
 		elseif action.type == 'shift'
-			let node = {'symbol': t, 'state': action.next, 'predecessor': node}
-			let cur += 1 " Scan the next input symbol into the lookahead buffer
+			let node = {'symbol': t, 'state': action.next, 'predecessor': node, 'start': col}
+			let [t, col] = lex.advance() " Scan the next input symbol into the lookahead buffer
+			let node.end = col
 		elseif action.type == 'reduce'
 			let L = action.arity
-			let new = {'symbol': action.lhs, 'children': []}
+			let new = {'symbol': action.lhs}
+			let last_child = {}
 			for i in range(L)
 				let child = node
 				let child.parent = new
-				call add(new.children, child)
+				let new.first_child = child
+				if last_child != {}
+					let child.right_sibling = last_child
+				endif
+				let last_child = child
+
 				let node = child.predecessor
 			endfor
 			let new.predecessor = node
 			let new.state = goto[node.state][action.lhs]
 			let node = new
 		endif
+	endwhile
+
+	return
+
+	" Inc parse
+	let stack = [] | let s = 0
+	let la = node " Set lookahead to root of tree
+	while v:true
+		if IsTerminal(la.symbol)
+			if la.has_changes()
+				call relex(la) " TODO Do incremental lexing before incremental parsing. Possible?
+				let la = ...
+			else
+				let action = actions[s][la.symbol]
+
+				if type(action) == v:t_string && action == 'error'
+					call recover()
+				elseif action.type == 'done'
+					if la == eof | return | else | call recover() | endif
+				elseif action.type == 'shift'
+					call shift(action.next)
+					let la = PopLookahead(la)
+				elseif action.type == 'reduce'
+					call reduce(r) " TODO
+				endif
+			endif
+		else
+			" This is a non-terminal lookahead
+			if la.has_changes()
+				let la = LeftBreakdown(la) " Split tree at changed points
+			else
+				" Reductions can only be processed with a terminal lookahead
+				let NextTerminal = {la -> eof} " Legal since LR(0) grammar
+				call PerformAllReductionsPossible(NextTerminal(la))
+				if (shiftable(la))
+					call shift(la)
+					" Do not have to do right breakdown since LR(0) grammar
+				else
+					let la = LeftBreakdown()
+				endif
+			endif
+		endif
+
+		break
 	endwhile
 endfunction
 
