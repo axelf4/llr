@@ -10,15 +10,20 @@
 " * https://dl.acm.org.sci-hub.tw/citation.cfm?id=357066
 
 " Action bit masks. super non optimal
-" TODO add accept/done
+" TODO add accept
 let [shift, reduce, error] = [0x8000, 0x4000, 0x2000] | lockvar shift reduce error
 
 function! Parse() abort
+	let regexes = [
+				\ {'name': 'num', 'regex': '\d\+'},
+				\ {'name': '+', 'regex': '+'},
+				\ {'name': 'ws', 'regex': '\s\+'},
+				\ ]
 	" List of productions
 	let grammar = [
-				\ {'lhs': 'S', 'rhs': ['X']},
-				\ {'lhs': 'X', 'rhs': ['(', 'X', ')']},
-				\ {'lhs': 'X', 'rhs': ['(', ')']},
+				\ {'lhs': 'S', 'rhs': ['Sums']},
+				\ {'lhs': 'Sums', 'rhs': ['Sums', '+', 'num']},
+				\ {'lhs': 'Sums', 'rhs': ['num']},
 				\ ]
 	echomsg grammar
 
@@ -153,8 +158,8 @@ function! Parse() abort
 		call add(actions, map(range(len(terminals)), '"error"'))
 		call add(goto, map(range(next_id), -1))
 
+		echomsg 'edges[i]: ' . string(edges[i])
 		for edge in edges[i]
-			echom edge
 			if IsNonTerminal(edge.symbol)
 				" Goto to that state
 				let goto[i][edge.symbol] = edge.to
@@ -172,13 +177,15 @@ function! Parse() abort
 			" echomsg 'Reduction item: ' . string(item) . ', i is ' . i . ' and A is ' . A . ' FollowSet: ' . string(FollowSet(A)) . ' eof: ' . eof
 			" for t in FollowSet(A)
 			if A != -1
+				echomsg actions[i]
 				for t in terminals
+					echomsg actions[i][t - num_non_terminals]
 					if actions[i][t - num_non_terminals] == 'shift' | throw 'Ambiguous grammar' | endif
 					let actions[i][t - num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
 				endfor
 			else
 				if item == {'production': {'lhs': -1, 'rhs': [ToId('S')]}, 'cursor': 1}
-					let actions[i][eof - num_non_terminals] = {'type': 'done'}
+					let actions[i][eof - num_non_terminals] = {'type': 'accept'}
 				endif
 			endif
 		endfor
@@ -229,7 +236,7 @@ function! Parse() abort
 			" Error
 			echomsg 'Error: stack: ' . string(node)
 			throw 'Bad input'
-		elseif action.type == 'done'
+		elseif action.type == 'accept'
 			" Finished successfully
 			echomsg 'Success: stack: ' . string(node)
 			break
@@ -273,7 +280,7 @@ function! Parse() abort
 
 				if type(action) == v:t_string && action == 'error'
 					call recover()
-				elseif action.type == 'done'
+				elseif action.type == 'accept'
 					if la == eof | return | else | call recover() | endif
 				elseif action.type == 'shift'
 					call shift(action.next)
