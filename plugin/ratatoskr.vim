@@ -11,6 +11,7 @@
 
 " Action bit masks. super non optimal
 " TODO add accept
+" Count on ~10x more productions than symbols
 let [shift, reduce, error] = [0x8000, 0x4000, 0x2000] | lockvar shift reduce error
 
 " Returns the parse tables for the specified LR(0) grammar.
@@ -66,8 +67,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols) abort
 
 	" Augment grammar with a production S' -> S, where S is the start symbol
 	" To generate the first item set, take the closure of the item S' -> •S
-	let initial_item_set = Closure([{'production': {'lhs': -1, 'rhs': [ToId('S')]}, 'cursor': 0}])
-	" let initial_item_set = Closure([{'production': {'lhs': -1, 'rhs': [ToId('S'), eof]}, 'cursor': 0}])
+	let initial_item_set = Closure([{'production': {'lhs': -1, 'rhs': [ToId('S'), eof]}, 'cursor': 0}])
 	" echomsg 'Initial item set: ' . string(initial_item_set)
 	let states = [initial_item_set] " Map from state index to associated closure
 	let edges = []
@@ -112,24 +112,26 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols) abort
 			endif
 		endfor
 
-		" Do reductions
+		" Given a final A-item for production P (A != S') fill corresponding
+		" row with reduce action for P
 		for item in state
-			" For every final A-item for production P in this state
-			if item.cursor != len(item.production.rhs) | continue | endif
 			let A = item.production.lhs
-			if A != -1
-				for t in terminals
-					let prev_action = actions[i][t - a:num_non_terminals]
+			if item.cursor != len(item.production.rhs) || A == -1 | continue | endif
 
-					" Automatically fixe Shift-Reduce Conflicts by not reducing when it would cause a conflict
-					if type(prev_action) != v:t_string || prev_action != 'error' | continue | endif
+			for t in terminals
+				let prev_action = actions[i][t - a:num_non_terminals]
+				" Automatically fix Shift-Reduce Conflicts by not reducing when it would cause a conflict
+				if type(prev_action) != v:t_string || prev_action != 'error' | continue | endif
 
-					let actions[i][t - a:num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
-				endfor
-			else
-				if item == {'production': {'lhs': -1, 'rhs': [ToId('S')]}, 'cursor': 1}
-					let actions[i][eof - a:num_non_terminals] = {'type': 'accept'}
-				endif
+				let actions[i][t - a:num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
+			endfor
+		endfor
+
+		" For every item set containing S' → w•eof, set accept in eof column
+		for item in state
+			if item.production.lhs == -1 && get(item.production.rhs, item.cursor, -1) == eof
+				let actions[i][eof - a:num_non_terminals] = {'type': 'accept'}
+				break
 			endif
 		endfor
 
