@@ -185,126 +185,154 @@ endfunction
 
 " Constructs a language object from the specified grammar/regexes.
 function! InitLanguage(grammar, regexes) abort
-	let [grammar, symbolMap, num_non_terminals, num_symbols, eof] = s:ExtractSymbols(a:grammar)
-	let symbol_to_name = s:ReverseDict(symbolMap)
+	let [grammar, symbol_map, num_non_terminals, num_symbols, eof] = s:ExtractSymbols(a:grammar)
+	let num_terminals = num_symbols - num_non_terminals
+	let symbol_to_name = s:ReverseDict(symbol_map)
 
 	let tables = s:BuildTables(grammar, num_non_terminals, num_symbols, eof)
 
+	" Build lexer regex pattern
+	if len(a:regexes) isnot num_terminals - 1 | throw 'Bad number of terminal regexes' | endif
+	let pattern = '\(' . join(map(sort(items(a:regexes), {a, b -> symbol_map[a[0]] - symbol_map[b[0]]}),
+				\ {i, v -> v[1]}), '\)\|\(') . '\)'
+	echom 'Lexer pattern: ' . pattern
+
 	let lexer = {}
-	function lexer.new(input) closure
+	function lexer.new() closure
 		let new = copy(self)
-		" Input list of symbols
-		let new.input = map(str2list(a:input), {k, v -> symbolMap[nr2char(v)]})
-		let new.cur = 0
+		let new.offset = 0 " Byte offset previously lexed
+		let new.has_eof = 0
 		return new
 	endfunction
 	function lexer.advance() closure
-		let symbol = get(self.input, self.cur, eof)
-		let col = self.cur
-		let self.cur += 1
-		return [symbol, col]
+		if self.has_eof | return [eof, 0] | endif
+
+		let [lnum, col, submatch] = searchpos(pattern, 'cepWz')
+		if submatch <= 1
+			echoerr 'Lexing: Invalid token'
+		endif
+		let byte = line2byte(lnum) - 1 + col
+		silent execute "normal! 1\<Space>"
+		let [bufnum, nlnum, ncol; rest] = getcurpos()
+		" If cursor stayed in place it has reached EOF
+		if nlnum == lnum && ncol == col | let self.has_eof = 1 | endif
+		" If token at end of line: include EOL char
+		if nlnum > lnum | let byte += 1 | endif
+
+		let symbol = submatch - 2 + num_non_terminals
+		echom 'Lexed symbol: ' . symbol_to_name[symbol]
+		let length = byte - self.offset
+		echom 'Length: ' . length
+		let self.offset = byte
+		return [symbol, length]
 	endfunction
 
 	return #{
 				\ tables: tables, lexer: lexer,
 				\ num_non_terminals: num_non_terminals,
+				\ symbol_to_name: symbol_to_name,
 				\ }
 endfunction
 
 function! Parse(lang) abort
-	let actions = a:lang.tables.actions | let goto = a:lang.tables.goto
-	let lexer = a:lang.lexer
-	let num_non_terminals = a:lang.num_non_terminals
+	let save_cursor = getcurpos()
+	try
+		call cursor(1, 1)
 
-	" let lex = lexer.new('i=i+i;i')
-	let lex = lexer.new(getline(1))
-	let bos = -1 " Symbol for bottom of stack
-	let node = {'symbol': bos, 'state': 0}
-	let [t, col] = lex.advance()
+		let actions = a:lang.tables.actions | let goto = a:lang.tables.goto
+		let lexer = a:lang.lexer
+		let num_non_terminals = a:lang.num_non_terminals
 
-	while v:true
-		let s = node.state
+		" let lex = lexer.new('i=i+i;i')
+		let lex = lexer.new()
+		let bos = -1 " Symbol for bottom of stack
+		let node = {'symbol': bos, 'state': 0}
+		let [t, length] = lex.advance()
 
-		let action = actions[s][t - num_non_terminals]
+		while v:true
+			let s = node.state
 
-		echomsg 'Doing action: ' . string(action)
+			let action = actions[s][t - num_non_terminals]
 
-		if type(action) == v:t_string && action == 'error'
-			" Error
-			echomsg 'Error: stack: ' . string(node)
-			throw 'Bad input'
-		elseif action.type == 'accept'
-			" Finished successfully
-			echomsg 'Success: stack: ' . string(node)
-			break
-		elseif action.type == 'shift'
-			let node = {'symbol': t, 'state': action.next, 'predecessor': node, 'start': col}
-			let [t, col] = lex.advance() " Scan the next input symbol into the lookahead buffer
-			let node.end = col
-		elseif action.type == 'reduce'
-			let L = action.arity
-			let new = {'symbol': action.lhs}
-			let last_child = {}
-			for i in range(L)
-				let child = node
-				let child.parent = new
-				let new.first_child = child
-				if last_child != {}
-					let child.right_sibling = last_child
-				endif
-				let last_child = child
+			echomsg 'Doing action: ' . string(action)
 
-				let node = child.predecessor
-			endfor
-			let new.predecessor = node
-			let new.state = goto[node.state][action.lhs]
-			let node = new
-		endif
-	endwhile
+			if type(action) == v:t_string && action == 'error'
+				" Error
+				echomsg 'Error: stack: ' . string(node)
+				throw 'Bad input'
+			elseif action.type == 'accept'
+				" Finished successfully
+				echomsg 'Success: stack: ' . string(node)
+				break
+			elseif action.type == 'shift'
+				let node = #{symbol: t, state: action.next, predecessor: node, length: length}
+				let [t, length] = lex.advance() " Scan the next input symbol into the lookahead buffer
+			elseif action.type == 'reduce'
+				let L = action.arity
+				let parent = {'symbol': action.lhs, 'length': 0}
+				let last_child = {}
+				for i in range(L)
+					let child = node
+					let child.parent = parent
+					let parent.length += child.length
+					if last_child != {}
+						let child.right_sibling = last_child
+					endif
+					let last_child = child
 
-	return node
-
-	" Inc parse
-	let stack = [] | let s = 0
-	let la = node " Set lookahead to root of tree
-	while v:true
-		if IsTerminal(la.symbol)
-			if la.has_changes()
-				call relex(la) " TODO Do incremental lexing before incremental parsing. Possible?
-				let la = ...
-			else
-				let action = actions[s][la.symbol]
-
-				if type(action) == v:t_string && action == 'error'
-					call recover()
-				elseif action.type == 'accept'
-					if la == eof | return | else | call recover() | endif
-				elseif action.type == 'shift'
-					call shift(action.next)
-					let la = PopLookahead(la)
-				elseif action.type == 'reduce'
-					call reduce(r) " TODO
-				endif
+					let node = child.predecessor
+				endfor
+				let parent.first_child = child
+				let parent.predecessor = node
+				let parent.state = goto[node.state][action.lhs]
+				let node = parent
 			endif
-		else
-			" This is a non-terminal lookahead
-			if la.has_changes()
-				let la = LeftBreakdown(la) " Split tree at changed points
-			else
-				" Reductions can only be processed with a terminal lookahead
-				let NextTerminal = {la -> eof} " Legal since LR(0) grammar
-				call PerformAllReductionsPossible(NextTerminal(la))
-				if (shiftable(la))
-					call shift(la)
-					" Do not have to do right breakdown since LR(0) grammar
+		endwhile
+
+		return node
+
+		" Inc parse
+		let stack = [] | let s = 0
+		let la = node " Set lookahead to root of tree
+		while v:true
+			if IsTerminal(la.symbol)
+				if la.has_changes()
+					call relex(la) " TODO Do incremental lexing before incremental parsing. Possible?
+					let la = ...
 				else
-					let la = LeftBreakdown()
+					let action = actions[s][la.symbol]
+
+					if type(action) == v:t_string && action == 'error'
+						call recover()
+					elseif action.type == 'accept'
+						if la == eof | return | else | call recover() | endif
+					elseif action.type == 'shift'
+						call shift(action.next)
+						let la = PopLookahead(la)
+					elseif action.type == 'reduce'
+						call reduce(r) " TODO
+					endif
+				endif
+			else
+				" This is a non-terminal lookahead
+				if la.has_changes()
+					let la = LeftBreakdown(la) " Split tree at changed points
+				else
+					" Reductions can only be processed with a terminal lookahead
+					let NextTerminal = {la -> eof} " Legal since LR(0) grammar
+					call PerformAllReductionsPossible(NextTerminal(la))
+					if (shiftable(la))
+						call shift(la)
+						" Do not have to do right breakdown since LR(0) grammar
+					else
+						let la = LeftBreakdown()
+					endif
 				endif
 			endif
-		endif
 
-		break
-	endwhile
+			break
+		endwhile
+	finally | call setpos('.', save_cursor) | endtry
 endfunction
 
 " List of productions
@@ -318,11 +346,46 @@ let s:grammar = [
 			\ ]
 
 let s:regexes = {
-			\ ';': ';',
+			\ ';': '\s*;\s*',
+			\ '+': '\s*+\s*',
+			\ '=': '\s*=\s*',
+			\ 'i': '\s*\d\+\s*',
 			\ }
 
+let v:errors = []
 let lang = InitLanguage(s:grammar, s:regexes)
 
 function! ParseBuffer() abort
 	let b:node = Parse(g:lang)
 endfunction
+
+function! GetSyntaxNode(lnum, col) abort
+	let byte = line2byte(a:lnum) - 1 + a:col
+	let node = b:node
+	let stack = [node]
+	let offset = 0
+	while has_key(node, 'first_child')
+		let node = node.first_child
+		while offset + node.length < byte
+			let offset += node.length
+			let node = node.right_sibling
+		endwhile
+		call add(stack, node)
+	endwhile
+
+	" return stack
+	return map(stack, {i, v -> g:lang.symbol_to_name[v.symbol]})
+endfunction
+
+function! GetSyntaxNodeUnderCursor() abort
+	return GetSyntaxNode(line('.'), col('.'))
+endfunction
+
+" On the topic of DS for storing node span information:
+"
+" Don't really want to store lnum since would have to update all when lines
+" are added/removed
+"
+" For that reason just storing byte length is probably nicest
+
+for error in v:errors | echoerr error | endfor
