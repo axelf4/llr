@@ -357,8 +357,35 @@ let s:regexes = {
 let v:errors = []
 let lang = InitLanguage(s:grammar, s:regexes)
 
+function! s:EditRanges(node, edit) abort
+	" If edit is entirely past this node
+	if edit.start > node.length | return | endif
+
+endfunction
+
+function! s:Listener(bufnr, start, end, added, changes) abort
+	echom 'lines ' .. a:start .. ' until ' .. a:end .. ' changed; added: ' .. a:added
+
+	if type(b:node) == v:t_number && b:node == v:null | return | endif
+
+	" Create appropriate edit structure
+	let old_len = b:node.length
+	let new_len = line2byte(line('$') + 1) - 1
+	let new_end = line2byte(a:end + a:added) - 1
+	" Inclusive start, exclusive end, all byte counts
+	let edit = #{
+				\ start: line2byte(a:start) - 1,
+				\ new_end: new_end,
+				\ old_end: new_end + (old_len - new_len),
+				\ }
+	echomsg edit
+endfunction
+
 function! ParseBuffer() abort
 	let b:node = Parse(g:lang)
+
+	if exists('b:listener_id') | call listener_remove(b:listener_id) | endif
+	let b:listener_id = listener_add(funcref('s:Listener'))
 endfunction
 
 function! GetSyntaxNode(lnum, col) abort
