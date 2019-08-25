@@ -9,6 +9,8 @@
 " * https://pages.github-dev.cs.illinois.edu/cs421-haskell/web-su19/files/handouts/lr-parsing-tables.pdf
 " * https://dl.acm.org.sci-hub.tw/citation.cfm?id=357066
 
+scriptversion 3
+
 " Action bit masks. super non optimal
 " TODO add accept
 " Count on ~10x more productions than symbols
@@ -62,7 +64,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	" To generate the first item set, take the closure of the item S' -> •S
 	let S = 0 " Assume that the start state has id 0
 	let initial_item_set = Closure([#{production: #{lhs: -1, rhs: [S, a:eof]}, cursor: 0}])
-	" echomsg 'Initial item set: ' . string(initial_item_set)
+	" echomsg 'Initial item set: ' .. string(initial_item_set)
 	let states = [initial_item_set] " Map from state index to associated closure
 	let edges = []
 	let n = 0
@@ -133,14 +135,14 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	endfor
 
 	echomsg 'Actions'
-	echomsg 'State | ' . string(terminals)
+	echomsg 'State | ' .. string(terminals)
 	for n in range(len(actions))
-		echomsg '' . n . ' | ' . string(actions[n])
+		echomsg '' .. n .. ' | ' .. string(actions[n])
 	endfor
 	echomsg 'Goto'
-	echomsg 'State | ' . string(nonterminals) . ' ' . string(terminals)
+	echomsg 'State | ' .. string(nonterminals) .. ' ' .. string(terminals)
 	for n in range(len(goto))
-		echomsg '' . n . ' | ' . string(goto[n])
+		echomsg '' .. n .. ' | ' .. string(goto[n])
 	endfor
 
 	return #{ actions: actions, goto: goto, }
@@ -193,9 +195,9 @@ function! InitLanguage(grammar, regexes) abort
 
 	" Build lexer regex pattern
 	if len(a:regexes) isnot num_terminals - 1 | throw 'Bad number of terminal regexes' | endif
-	let pattern = '\(' . join(map(sort(items(a:regexes), {a, b -> symbol_map[a[0]] - symbol_map[b[0]]}),
-				\ {i, v -> v[1]}), '\)\|\(') . '\)'
-	echom 'Lexer pattern: ' . pattern
+	let pattern = '\(' .. join(map(sort(items(a:regexes), {a, b -> symbol_map[a[0]] - symbol_map[b[0]]}),
+				\ {i, v -> v[1]}), '\)\|\(') .. '\)'
+	echom 'Lexer pattern: ' .. pattern
 
 	let lexer = {}
 	function lexer.new() closure
@@ -217,12 +219,12 @@ function! InitLanguage(grammar, regexes) abort
 		" If cursor stayed in place it has reached EOF
 		if nlnum == lnum && ncol == col | let self.has_eof = 1 | endif
 		" If token at end of line: include EOL char
-		if nlnum > lnum | let byte += 1 | endif
+		if nlnum > lnum || ncol == col | let byte += 1 | endif
 
 		let symbol = submatch - 2 + num_non_terminals
-		echom 'Lexed symbol: ' . symbol_to_name[symbol]
+		echom 'Lexed symbol: ' .. symbol_to_name[symbol]
 		let length = byte - self.offset
-		echom 'Length: ' . length
+		echom 'Length: ' .. length
 		let self.offset = byte
 		return [symbol, length]
 	endfunction
@@ -254,15 +256,15 @@ function! Parse(lang) abort
 
 			let action = actions[s][t - num_non_terminals]
 
-			echomsg 'Doing action: ' . string(action)
+			echomsg 'Doing action: ' .. string(action)
 
 			if type(action) == v:t_string && action == 'error'
 				" Error
-				echomsg 'Error: stack: ' . string(node)
+				echomsg 'Error: stack: ' .. string(node)
 				throw 'Bad input'
 			elseif action.type == 'accept'
 				" Finished successfully
-				echomsg 'Success: stack: ' . string(node)
+				echomsg 'Success: stack: ' .. string(node)
 				break
 			elseif action.type == 'shift'
 				let node = #{symbol: t, state: action.next, predecessor: node, length: length}
