@@ -357,17 +357,44 @@ let s:regexes = {
 let v:errors = []
 let lang = InitLanguage(s:grammar, s:regexes)
 
+" Adjust the byte lengths of the specified node given an edit.
+"
+" Should be done before re-parsing. The edit must be entirely contained inside
+" node. {edit} may be modified in-place.
 function! s:EditRanges(node, edit) abort
-	" If edit is entirely past this node
-	if edit.start > node.length | return | endif
+	" Validate edit range
+	if a:edit.start < 0 || a:edit.old_end > a:node.length
+		throw 'Edit is outside this node'
+	endif
 
+	let a:node.modified = 1
+	" Enlarge according to edit length difference
+	let a:node.length += a:edit.new_end - a:edit.old_end
+
+	" Edit child ranges
+	let child = get(a:node, 'first_child', v:null)
+	while type(child) != v:t_string && child isnot# v:null
+		let old_child_length = child.length " Store child len before it might change
+		if a:edit.start <= child.length
+			let child_edit = copy(a:edit)
+			if child_edit.old_end > child.length | let child_edit.old_end = child.length | endif
+			call s:EditRanges(child, child_edit) " Recurse
+
+			let a:edit.new_end = 0 " Distribute all new len to first child
+		else
+			let a:edit.new_end -= child.length
+		endif
+
+		let a:edit.start -= old_child_length
+		if a:edit.start < 0 | let a:edit.start = 0 | endif
+		let a:edit.old_end -= old_child_length
+		if a:edit.old_end <= 0 | break | endif
+
+		let child = get(child, 'right_sibling', v:null)
+	endwhile
 endfunction
 
 function! s:Listener(bufnr, start, end, added, changes) abort
-	echom 'lines ' .. a:start .. ' until ' .. a:end .. ' changed; added: ' .. a:added
-
-	if type(b:node) == v:t_number && b:node == v:null | return | endif
-
 	" Create appropriate edit structure
 	let old_len = b:node.length
 	let new_len = line2byte(line('$') + 1) - 1
@@ -378,7 +405,11 @@ function! s:Listener(bufnr, start, end, added, changes) abort
 				\ new_end: new_end,
 				\ old_end: new_end + (old_len - new_len),
 				\ }
-	echomsg edit
+	echomsg 'lines ' .. a:start .. ' until ' .. a:end .. ' changed; added: ' .. a:added
+				\ .. ', edit: ' .. string(edit)
+
+	if type(b:node) == v:t_number && b:node == v:null | return | endif
+	call s:EditRanges(b:node, edit) " Adjust node ranges
 endfunction
 
 function! ParseBuffer() abort
@@ -393,7 +424,20 @@ function! GetSyntaxNode(lnum, col) abort
 	let node = b:node
 	let stack = [node]
 	let offset = 0
+	echom 'Root len: ' .. node.length
+
 	while has_key(node, 'first_child')
+		" Output debug information
+		echomsg 'Top level: -------'
+		if has_key(node, 'first_child')
+			let child = node.first_child
+			while 1
+				echomsg 'Child: ' .. g:lang.symbol_to_name[child.symbol] .. ' len: ' .. child.length
+				if !has_key(child, 'right_sibling') | break | endif
+				let child = child.right_sibling
+			endwhile
+		endif
+
 		let node = node.first_child
 		while offset + node.length < byte
 			let offset += node.length
