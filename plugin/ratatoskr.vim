@@ -22,11 +22,11 @@ scriptversion 3
 function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	let [nonterminals, terminals] = [range(a:num_non_terminals), range(a:num_non_terminals, a:num_symbols - 1)]
 
-	" Returns whether the specified symbol is non-terminal.
+	" Returns whether the specified symbol is nonterminal.
 	function! IsNonTerminal(symbol) abort closure
 		call assert_true(type(a:symbol) == v:t_number
 					\ && a:symbol >= 0 && a:symbol < a:num_symbols, 'Invalid symbol')
-		return a:symbol < a:num_non_terminals " Non-terminal symbols are given the smaller id:s
+		return a:symbol < a:num_non_terminals " Nonterminal symbols are given the smaller id:s
 	endfunction
 	let IsTerminal = {symbol -> !IsNonTerminal(symbol)}
 
@@ -37,7 +37,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		let i = 0
 		while i < len(a:item_set)
 			let item = a:item_set[i]
-			" If the item set contains an item with the cursor just to the left of some non-terminal N
+			" If the item set contains an item with the cursor just to the left of some nonterminal N
 			let N = get(item.production.rhs, item.cursor, -1)
 			if N != -1 && IsNonTerminal(N)
 				" Add to the item set all initial items for the N-productions of the grammar, recursively
@@ -99,10 +99,8 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		call add(goto, map(range(a:num_symbols), -1))
 
 		for edge in edges[i]
-			if IsNonTerminal(edge.symbol)
-				" Goto to that state
-				let goto[i][edge.symbol] = edge.to
-			else
+			let goto[i][edge.symbol] = edge.to " Goto to that state
+			if IsTerminal(edge.symbol)
 				" Transition to another State using a Terminal Symbol is a shift to that State
 				let actions[i][edge.symbol - a:num_non_terminals] = {'type': 'shift', 'next': edge.to}
 			endif
@@ -209,6 +207,8 @@ function! InitLanguage(grammar, regexes) abort
 	function lexer.advance() closure
 		if self.has_eof | return [eof, 0] | endif
 
+		" TODO Position cursor on char before and don't accept match at cursor
+		" pos instead
 		let [lnum, col, submatch] = searchpos(pattern, 'cepWz')
 		if submatch <= 1
 			echoerr 'Lexing: Invalid token'
@@ -231,7 +231,7 @@ function! InitLanguage(grammar, regexes) abort
 
 	return #{
 				\ tables: tables, lexer: lexer,
-				\ num_non_terminals: num_non_terminals,
+				\ num_non_terminals: num_non_terminals, eof: eof,
 				\ symbol_to_name: symbol_to_name,
 				\ }
 endfunction
@@ -292,48 +292,6 @@ function! Parse(lang) abort
 		endwhile
 
 		return node
-
-		" Inc parse
-		let stack = [] | let s = 0
-		let la = node " Set lookahead to root of tree
-		while v:true
-			if IsTerminal(la.symbol)
-				if la.has_changes()
-					call relex(la) " TODO Do incremental lexing before incremental parsing. Possible?
-					let la = ...
-				else
-					let action = actions[s][la.symbol]
-
-					if type(action) == v:t_string && action == 'error'
-						call recover()
-					elseif action.type == 'accept'
-						if la == eof | return | else | call recover() | endif
-					elseif action.type == 'shift'
-						call shift(action.next)
-						let la = PopLookahead(la)
-					elseif action.type == 'reduce'
-						call reduce(r) " TODO
-					endif
-				endif
-			else
-				" This is a non-terminal lookahead
-				if la.has_changes()
-					let la = LeftBreakdown(la) " Split tree at changed points
-				else
-					" Reductions can only be processed with a terminal lookahead
-					let NextTerminal = {la -> eof} " Legal since LR(0) grammar
-					call PerformAllReductionsPossible(NextTerminal(la))
-					if (shiftable(la))
-						call shift(la)
-						" Do not have to do right breakdown since LR(0) grammar
-					else
-						let la = LeftBreakdown()
-					endif
-				endif
-			endif
-
-			break
-		endwhile
 	finally | call setpos('.', save_cursor) | endtry
 endfunction
 
@@ -394,6 +352,157 @@ function! s:EditRanges(node, edit) abort
 	endwhile
 endfunction
 
+" Decompose a nonterminal lookahead.
+function! s:LeftBreakdown(la, offset) abort
+	return has_key(a:la, 'first_child') ? [a:la.first_child, a:offset]
+				\ : s:PopLookahead(a:la, a:offset)
+endfunction
+" Pop right stack by traversing previous tree structure.
+function! s:PopLookahead(la, offset) abort
+	while !has_key(a:la, 'right_sibling')
+		let a:offset += a:la.length - a:la.parent.length
+		let a:la = a:la.parent
+	endwhile
+	return [a:la.right_sibling, a:offset + a:la.length]
+endfunction
+
+function! s:IncParse(lang, node) abort
+	let save_cursor = getcurpos()
+	try
+		call cursor(1, 1)
+
+		let actions = a:lang.tables.actions | let goto = a:lang.tables.goto
+		let num_non_terminals = a:lang.num_non_terminals
+		let eof = a:lang.eof
+		let IsTerminal = {symbol -> symbol >= num_non_terminals}
+
+		let lex = a:lang.lexer.new()
+		" Initialize the parse stack to contain only bos
+		let stack = #{stack: []}
+		function stack.push(node) abort closure
+			call extend(self.stack, [state, a:node])
+		endfunction
+		function stack.pop() abort closure
+			let [state, node] = remove(self.stack, -2, -1)
+			return node
+		endfunction
+		let root = #{symbol: -3}
+		let bos = #{symbol: -1, parent: root, right_sibling: a:node}
+		let eos = #{symbol: a:lang.eof, parent: root}
+		let a:node.parent = root | let a:node.right_sibling = eos
+		let root.first_child = bos
+		let state = 0 | call stack.push(bos)
+
+		" let la = s:PopLookahead(bos) " Set lookahead to root of tree
+		let la = a:node
+		let offset = 0 " Byte offset for lexing
+
+		" Shift a node onto the parse stack and update the current parse
+		" state.
+		function! Shift(node) abort closure
+			call stack.push(a:node)
+			let state = goto[state][a:node.symbol]
+		endfunction
+
+		" Remove any subtrees on top of parse stack with null yield, then
+		" break down right edge of topmost subtree.
+		function! RightBreakdown() abort closure
+			while 1
+				" Replace top of stack with its children
+				let node = stack.pop()
+				" Does nothing when node is a terminal symbol
+				if has_key(node, 'first_child')
+					let child = node.first_child
+					while 1
+						call Shift(child)
+						if !has_key(child, 'right_sibling') | break | endif
+						let child = child.right_sibling
+					endwhile
+				endif
+				if IsTerminal(node.symbol) | break | endif
+			endwhile
+			call Shift(node) " Leave final terminal symbol on top of stack
+		endfunction
+
+		function! Reduce(action) abort closure
+			let L = action.arity
+			let parent = #{symbol: action.lhs, length: 0} " TODO Reuse parent
+			let last_child = {}
+			" TODO Use last child to check for prev parent
+			for i in range(L)
+				let child = stack.pop()
+				let child.parent = parent
+				let parent.length += child.length
+				if last_child != {}
+					let child.right_sibling = last_child
+				endif
+				let last_child = child
+			endfor
+			let parent.first_child = child
+
+			call stack.push(parent)
+			let state = goto[state][action.lhs]
+		endfunction
+
+		" Relex a continuous region of modified nodes.
+		function! Relex() abort closure
+			" Position cursor for relexing the dirty node
+			let lnum = byte2line(offset + 1)
+			let col = offset + 2 - line2byte(line)
+			call cursor(lnum, col)
+
+			let [symbol, length] = lex.advance()
+			let offset += length
+		endfunction
+
+		while 1
+			if IsTerminal(la.symbol)
+				if get(la, 'modified', 0)
+					call Relex()
+				else
+					let action = actions[state][la.symbol - num_non_terminals]
+					echomsg 'Nondirty terminal: ' .. la.symbol .. ' Doing action: ' .. string(action)
+
+					if type(action) == v:t_string && action == 'error'
+						call Recover()
+					elseif action.type == 'accept'
+						if la is eos
+							echom 'Parsed successfully!!'
+							return
+						else | call Recover() | endif
+					elseif action.type == 'shift'
+						call Shift(la)
+						let [la, offset] = s:PopLookahead(la, offset)
+					elseif action.type == 'reduce'
+						call Reduce(action)
+					endif
+				endif
+			else " This is a nonterminal lookahead
+				if get(la, 'modified', 0)
+					let [la, offset] = s:LeftBreakdown(la, offset) " Split tree at changed points
+				else
+					" Perform all reductions possible
+					" Reductions can only be processed with a terminal lookahead
+					let next_terminal = eof " Legal since LR(0) grammar
+					while 1
+						let action = actions[state][next_terminal - num_non_terminals]
+						if type(action) == v:t_dict && action.type == 'reduce'
+							call Reduce(action)
+						else | break | endif
+					endwhile
+
+					let shiftable = goto[state][la.symbol] isnot -1
+					echom 'Shiftable nonterminal?: ' .. string(shiftable)
+					if shiftable
+						" Place lookahead on stack with its right-hand edge removed
+						call Shift(la) | call RightBreakdown() | let [la, offset] = s:PopLookahead(la, offset)
+					else | let [la, offset] = s:LeftBreakdown(la, offset) | endif
+				endif
+			endif
+		endwhile
+	finally | call setpos('.', save_cursor) | endtry
+endfunction
+
 function! s:Listener(bufnr, start, end, added, changes) abort
 	" Create appropriate edit structure
 	let old_len = b:node.length
@@ -417,6 +526,12 @@ function! ParseBuffer() abort
 
 	if exists('b:listener_id') | call listener_remove(b:listener_id) | endif
 	let b:listener_id = listener_add(funcref('s:Listener'))
+
+	return b:node
+endfunction
+
+function! IncParseBuffer() abort
+	return s:IncParse(g:lang, b:node)
 endfunction
 
 function! GetSyntaxNode(lnum, col) abort
