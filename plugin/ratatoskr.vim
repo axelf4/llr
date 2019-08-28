@@ -38,13 +38,13 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		while i < len(a:item_set)
 			let item = a:item_set[i]
 			" If the item set contains an item with the cursor just to the left of some nonterminal N
-			let N = get(item.production.rhs, item.cursor, -1)
+			let N = item.production.rhs->get(item.cursor, -1)
 			if N != -1 && IsNonTerminal(N)
 				" Add to the item set all initial items for the N-productions of the grammar, recursively
 				for production in a:grammar
 					if production.lhs isnot# N | continue | endif
 					let new_item = #{production: production, cursor: 0}
-					if index(a:item_set, new_item) == -1 | call add(a:item_set, new_item) | endif " Only add if unique
+					if a:item_set->index(new_item) == -1 | call add(a:item_set, new_item) | endif " Only add if unique
 				endfor
 			endif
 			let i += 1
@@ -55,8 +55,8 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	" Returns Goto(I, X) = Closure({A → aX•b | A -> a•Xb in I}).
 	"
 	" Modifies the specified list in-situ.
-	let Goto = {item_set, x -> Closure(map(filter(item_set, {k, v -> get(v.production.rhs, v.cursor, -1) == x}),
-				\ {k, v -> extend(v, #{cursor: v.cursor + 1})}))}
+	let Goto = {item_set, x -> item_set->filter({k, v -> v.production.rhs->get(v.cursor, -1) == x})
+				\ ->map({k, v -> extend(v, #{cursor: v.cursor + 1})})->Closure()}
 
 	" Create the DFA
 
@@ -72,7 +72,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		let state = states[n]
 		call add(edges, [])
 		for item in state
-			let x = get(item.production.rhs, item.cursor, -1) " Symbol to the right of dot
+			let x = item.production.rhs->get(item.cursor, -1) " Symbol to the right of dot
 			if x != -1
 				let goto = Goto(deepcopy(state), x)
 				let n_prime = index(states, goto)
@@ -123,7 +123,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 
 		" For every item set containing S' → w•eof, set accept in eof column
 		for item in state
-			if item.production.lhs == -1 && get(item.production.rhs, item.cursor, -1) == a:eof
+			if item.production.lhs == -1 && item.production.rhs->get(item.cursor, -1) == a:eof
 				let actions[i][a:eof - a:num_non_terminals] = {'type': 'accept'}
 				break
 			endif
@@ -153,7 +153,7 @@ function! s:ExtractSymbols(grammar) abort
 	let extracted_symbols = {}
 	let next_id = 0
 	function ToId(x) abort closure
-		let id = get(extracted_symbols, a:x, -1)
+		let id = extracted_symbols->get(a:x, -1)
 		if id == -1
 			let id = next_id
 			let extracted_symbols[a:x] = id
@@ -193,8 +193,8 @@ function! InitLanguage(grammar, regexes) abort
 
 	" Build lexer regex pattern
 	if len(a:regexes) isnot num_terminals - 1 | throw 'Bad number of terminal regexes' | endif
-	let pattern = '\(' .. join(map(sort(items(a:regexes), {a, b -> symbol_map[a[0]] - symbol_map[b[0]]}),
-				\ {i, v -> v[1]}), '\)\|\(') .. '\)'
+	let pattern = '\(' .. a:regexes->items()->sort({a, b -> symbol_map[a[0]] - symbol_map[b[0]]})
+				\ ->map({i, v -> v[1]})->join('\)\|\(') .. '\)'
 	echom 'Lexer pattern: ' .. pattern
 
 	let lexer = {}
