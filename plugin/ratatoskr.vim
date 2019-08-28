@@ -14,7 +14,7 @@ scriptversion 3
 " Action bit masks. super non optimal
 " TODO add accept
 " Count on ~10x more productions than symbols
-" let [s:shift, s:reduce, s:error] = [0x8000, 0x4000, 0x2000] | lockvar s:shift s:reduce s:error
+" const [s:shift, s:reduce, s:error] = [0x8000, 0x4000, 0x2000]
 
 " Returns the parse tables for the specified LR(0) grammar.
 "
@@ -204,6 +204,14 @@ function! InitLanguage(grammar, regexes) abort
 		let new.has_eof = 0
 		return new
 	endfunction
+	" Positions the cursor for lexing the node at the specified offset.
+	function lexer.set_offset(offset)
+		let self.offset = a:offset
+		let lnum = byte2line(a:offset + 1)
+		let col = a:offset + 2 - line2byte(lnum)
+		call cursor(lnum, col)
+		return [lnum, col]
+	endfunction
 	function lexer.advance() closure
 		if self.has_eof | return [eof, 0] | endif
 
@@ -222,10 +230,9 @@ function! InitLanguage(grammar, regexes) abort
 		if nlnum > lnum || ncol == col | let byte += 1 | endif
 
 		let symbol = submatch - 2 + num_non_terminals
-		echom 'Lexed symbol: ' .. symbol_to_name[symbol]
 		let length = byte - self.offset
-		echom 'Length: ' .. length
 		let self.offset = byte
+		echom 'Lexed symbol: ' .. symbol_to_name[symbol] .. ', length: ' .. length
 		return [symbol, length]
 	endfunction
 
@@ -352,20 +359,6 @@ function! s:EditRanges(node, edit) abort
 	endwhile
 endfunction
 
-" Decompose a nonterminal lookahead.
-function! s:LeftBreakdown(la, offset) abort
-	return has_key(a:la, 'first_child') ? [a:la.first_child, a:offset]
-				\ : s:PopLookahead(a:la, a:offset)
-endfunction
-" Pop right stack by traversing previous tree structure.
-function! s:PopLookahead(la, offset) abort
-	while !has_key(a:la, 'right_sibling')
-		let a:offset += a:la.length - a:la.parent.length
-		let a:la = a:la.parent
-	endwhile
-	return [a:la.right_sibling, a:offset + a:la.length]
-endfunction
-
 function! s:IncParse(lang, node) abort
 	let save_cursor = getcurpos()
 	try
@@ -387,15 +380,30 @@ function! s:IncParse(lang, node) abort
 			return node
 		endfunction
 		let root = #{symbol: -3}
-		let bos = #{symbol: -1, parent: root, right_sibling: a:node}
-		let eos = #{symbol: a:lang.eof, parent: root}
+		let bos = #{symbol: -1, length: 0, parent: root, right_sibling: a:node}
+		let eos = #{symbol: a:lang.eof, length: 0, parent: root}
 		let a:node.parent = root | let a:node.right_sibling = eos
 		let root.first_child = bos
 		let state = 0 | call stack.push(bos)
 
-		" let la = s:PopLookahead(bos) " Set lookahead to root of tree
+		" let la = PopLookahead(bos) " Set lookahead to root of tree
 		let la = a:node
 		let offset = 0 " Byte offset for lexing
+
+		" Decompose a nonterminal lookahead.
+		function! LeftBreakdown(la) abort closure
+			return has_key(a:la, 'first_child') ? a:la.first_child : PopLookahead(a:la)
+		endfunction
+		" Pop right stack by traversing previous tree structure.
+		function! PopLookahead(la) abort closure
+			let node = a:la
+			while !has_key(node, 'right_sibling')
+				echom 'PopLookahead: node: ' .. node.symbol
+				if !has_key(node, 'parent') | return eos | endif
+				let node = node.parent
+			endwhile
+			return node.right_sibling
+		endfunction
 
 		" Shift a node onto the parse stack and update the current parse
 		" state.
@@ -407,11 +415,10 @@ function! s:IncParse(lang, node) abort
 		" Remove any subtrees on top of parse stack with null yield, then
 		" break down right edge of topmost subtree.
 		function! RightBreakdown() abort closure
-			while 1
-				" Replace top of stack with its children
+			while 1 " Replace top of stack with its children
 				let node = stack.pop()
 				" Does nothing when node is a terminal symbol
-				if has_key(node, 'first_child')
+				if node->has_key('first_child')
 					let child = node.first_child
 					while 1
 						call Shift(child)
@@ -435,10 +442,13 @@ function! s:IncParse(lang, node) abort
 				let parent.length += child.length
 				if last_child != {}
 					let child.right_sibling = last_child
+				else
+					if child->has_key('right_sibling') | unlet! child.right_sibling | endif
 				endif
 				let last_child = child
 			endfor
 			let parent.first_child = child
+			let parent.modified = 0
 
 			call stack.push(parent)
 			let state = goto[state][action.lhs]
@@ -446,19 +456,82 @@ function! s:IncParse(lang, node) abort
 
 		" Relex a continuous region of modified nodes.
 		function! Relex() abort closure
-			" Position cursor for relexing the dirty node
-			let lnum = byte2line(offset + 1)
-			let col = offset + 2 - line2byte(line)
-			call cursor(lnum, col)
+			let cur = lex.set_offset(offset)
+			echom 'Relexing at ' .. string(cur)
+			let diff = 0 " Cursor offset to start of the current lookahead
+			let first = 1
+			let node = la
+			let cycles = 0
 
-			let [symbol, length] = lex.advance()
-			let offset += length
+			" FIXME The control graph is needlessly complicated
+			while 1
+				let should_move_to_next = 1
+				let [symbol, length] = lex.advance()
+
+				" Check if node reuse is possible
+				if symbol == node.symbol
+					echom 'Reusing node! oldlen: ' .. node.length
+					let diff += length - node.length
+					let node.length = length " Update length
+					let node.modified = 0
+				else
+					echom 'Could not reuse node: ' .. node.symbol
+					" Either drop the old node or insert before, depending on if
+					" we have moved past it
+					let new_node = #{symbol: symbol, length: length}
+					if diff >= node.length " Drop
+						echom 'Dropping old node'
+						let diff += length - node.length
+						if node->has_key('parent') | let new_node.parent = node.parent | endif
+						if node->has_key('right_sibling') | let new_node.right_sibling = node.right_sibling | endif
+					else " Insert before
+						echom 'Insert before'
+						let diff += length
+						let new_node.right_sibling = node
+						if node->has_key('parent') | let new_node.parent = node.parent | endif
+						let should_move_to_next = 0
+					endif
+
+					if first
+						let la = new_node
+					else
+						let prev.right_sibling = new_node
+						let node = new_node
+					endif
+				endif
+
+				echom 'Diff is ' .. diff
+				if diff == 0 | break | endif " If synced up, break
+				let first = 0
+				if should_move_to_next
+					let prev = node
+					if lex.has_eof
+						echom 'Has eof!'
+						let node = eos
+					else
+						" Move to the next terminal
+						let node = PopLookahead(node)
+						while !IsTerminal(node.symbol) | let node = LeftBreakdown(node) | endwhile
+					endif
+					let prev.right_sibling = node
+				endif
+				let cycles += 1
+				if cycles > 5 | break | endif
+			endwhile
 		endfunction
 
 		while 1
+			echomsg 'La is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0)
 			if IsTerminal(la.symbol)
 				if get(la, 'modified', 0)
 					call Relex()
+					echomsg ' After relex'
+					let child = la
+					while 1
+						echomsg 'Child: ' .. g:lang.symbol_to_name[child.symbol] .. ' len: ' .. child.length
+						if !has_key(child, 'right_sibling') | break | endif
+						let child = child.right_sibling
+					endwhile
 				else
 					let action = actions[state][la.symbol - num_non_terminals]
 					echomsg 'Nondirty terminal: ' .. la.symbol .. ' Doing action: ' .. string(action)
@@ -472,14 +545,15 @@ function! s:IncParse(lang, node) abort
 						else | call Recover() | endif
 					elseif action.type == 'shift'
 						call Shift(la)
-						let [la, offset] = s:PopLookahead(la, offset)
+						let offset += la.length
+						let la = PopLookahead(la)
 					elseif action.type == 'reduce'
 						call Reduce(action)
 					endif
 				endif
 			else " This is a nonterminal lookahead
 				if get(la, 'modified', 0)
-					let [la, offset] = s:LeftBreakdown(la, offset) " Split tree at changed points
+					let la = LeftBreakdown(la) " Split tree at changed points
 				else
 					" Perform all reductions possible
 					" Reductions can only be processed with a terminal lookahead
@@ -495,8 +569,9 @@ function! s:IncParse(lang, node) abort
 					echom 'Shiftable nonterminal?: ' .. string(shiftable)
 					if shiftable
 						" Place lookahead on stack with its right-hand edge removed
-						call Shift(la) | call RightBreakdown() | let [la, offset] = s:PopLookahead(la, offset)
-					else | let [la, offset] = s:LeftBreakdown(la, offset) | endif
+						let offset += la.length
+						call Shift(la) | call RightBreakdown() | let la = PopLookahead(la)
+					else | let la = LeftBreakdown(la) | endif
 				endif
 			endif
 		endwhile
@@ -562,7 +637,7 @@ function! GetSyntaxNode(lnum, col) abort
 	endwhile
 
 	" return stack
-	return map(stack, {i, v -> g:lang.symbol_to_name[v.symbol]})
+	return string(map(stack, {i, v -> g:lang.symbol_to_name[v.symbol]})) .. ', modified: ' .. node->get('modified', 0) .. ', length: ' .. node.length
 endfunction
 
 function! GetSyntaxNodeUnderCursor() abort
