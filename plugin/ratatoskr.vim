@@ -188,6 +188,7 @@ function! InitLanguage(grammar, regexes) abort
 	let [grammar, symbol_map, num_non_terminals, num_symbols, eof] = s:ExtractSymbols(a:grammar)
 	let num_terminals = num_symbols - num_non_terminals
 	let symbol_to_name = s:ReverseDict(symbol_map)
+	let symbol_to_name[eof] = '$'
 
 	let tables = s:BuildTables(grammar, num_non_terminals, num_symbols, eof)
 
@@ -399,8 +400,10 @@ function! s:IncParse(lang, node) abort
 			let node = a:la
 			while !has_key(node, 'right_sibling')
 				echom 'PopLookahead: node: ' .. node.symbol
+				if node.symbol == eof | throw 'thest' |endif
 				if !has_key(node, 'parent') | return eos | endif
 				let node = node.parent
+				if node is root | return eos | endif
 			endwhile
 			return node.right_sibling
 		endfunction
@@ -458,70 +461,66 @@ function! s:IncParse(lang, node) abort
 		function! Relex() abort closure
 			let cur = lex.set_offset(offset)
 			echom 'Relexing at ' .. string(cur)
-			let diff = 0 " Cursor offset to start of the current lookahead
-			let first = 1
 			let node = la
+			let diff = 0 " Cursor offset to start of the current lookahead
+			let need_new_node = 0
+			let first = 1
 			let cycles = 0
 
-			" FIXME The control graph is needlessly complicated
 			while 1
-				let should_move_to_next = 1
 				let [symbol, length] = lex.advance()
 
-				" Check if node reuse is possible
-				if symbol == node.symbol
-					echom 'Reusing node! oldlen: ' .. node.length
-					let diff += length - node.length
-					let node.length = length " Update length
-					let node.modified = 0
-				else
-					echom 'Could not reuse node: ' .. node.symbol
-					" Either drop the old node or insert before, depending on if
-					" we have moved past it
-					let new_node = #{symbol: symbol, length: length}
-					if diff >= node.length " Drop
-						echom 'Dropping old node'
-						let diff += length - node.length
-						if node->has_key('parent') | let new_node.parent = node.parent | endif
-						if node->has_key('right_sibling') | let new_node.right_sibling = node.right_sibling | endif
-					else " Insert before
-						echom 'Insert before'
-						let diff += length
-						let new_node.right_sibling = node
-						if node->has_key('parent') | let new_node.parent = node.parent | endif
-						let should_move_to_next = 0
-					endif
+				while symbol != node.symbol && diff >= node.length || need_new_node
+					if node.symbol == eof | break | endif " XXX: Hack!
+					let need_new_node = 0
+					" Drop nodes that have been overrun
+					let diff -= node.length
+					" Move to the next terminal
+					let node = PopLookahead(node)
+					while !IsTerminal(node.symbol)
+						let node = LeftBreakdown(node)
+					endwhile
+				endwhile
 
-					if first
-						let la = new_node
-					else
-						let prev.right_sibling = new_node
-						let node = new_node
-					endif
+				if symbol == eof
+					let new_node = eos
+				elseif symbol == node.symbol " If node reuse is possible
+					echom ' Reusing node! oldlen: ' .. node.length
+					let node.length = length | let node.modified = 0
+					let need_new_node = 1
+					let new_node = node
+				else
+					echom ' Inserting new node before'
+					let new_node = #{symbol: symbol, length: length, right_sibling: node}
+					if node->has_key('parent') | let new_node.parent = node.parent | endif
 				endif
+				if first | let la = new_node | else | let prev.right_sibling = new_node | endif
+				let diff += length
+
+				" TODO Is this legal?
+				while diff >= node.length
+					if node.symbol == eof | break | endif " XXX: Hack!
+					let need_new_node = 0
+					" Drop nodes that have been overrun
+					let diff -= node.length
+					" Move to the next terminal
+					let node = PopLookahead(node)
+					while !IsTerminal(node.symbol)
+						let node = LeftBreakdown(node)
+					endwhile
+				endwhile
 
 				echom 'Diff is ' .. diff
 				if diff == 0 | break | endif " If synced up, break
-				let first = 0
-				if should_move_to_next
-					let prev = node
-					if lex.has_eof
-						echom 'Has eof!'
-						let node = eos
-					else
-						" Move to the next terminal
-						let node = PopLookahead(node)
-						while !IsTerminal(node.symbol) | let node = LeftBreakdown(node) | endwhile
-					endif
-					let prev.right_sibling = node
-				endif
+				let first = 0 | let prev = new_node
+
 				let cycles += 1
-				if cycles > 5 | break | endif
+				if cycles > 7 | throw 'Infinite relexing?' | endif
 			endwhile
 		endfunction
 
 		while 1
-			echomsg 'La is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0)
+			echomsg 'Lookahead is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0)
 			if IsTerminal(la.symbol)
 				if get(la, 'modified', 0)
 					call Relex()
