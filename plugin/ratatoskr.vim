@@ -398,9 +398,10 @@ function! s:IncParse(lang, node) abort
 		" Pop right stack by traversing previous tree structure.
 		function! PopLookahead(la) abort closure
 			let node = a:la
+			echom 'Start of PopLookahead'
+			if node.symbol == eof | throw 'thest' |endif
 			while !has_key(node, 'right_sibling')
 				echom 'PopLookahead: node: ' .. node.symbol
-				if node.symbol == eof | throw 'thest' |endif
 				if !has_key(node, 'parent') | return eos | endif
 				let node = node.parent
 				if node is root | return eos | endif
@@ -465,27 +466,30 @@ function! s:IncParse(lang, node) abort
 			let diff = 0 " Cursor offset to start of the current lookahead
 			let need_new_node = 0
 			let first = 1
-			let cycles = 0
 
 			while 1
 				let [symbol, length] = lex.advance()
+				let diff += length
 
-				while symbol != node.symbol && diff >= node.length || need_new_node
-					if node.symbol == eof | break | endif " XXX: Hack!
-					let need_new_node = 0
-					" Drop nodes that have been overrun
-					let diff -= node.length
-					" Move to the next terminal
+				while 1
+					if !need_new_node
+						if symbol == node.symbol || diff < node.length || node.symbol == eof
+							break
+						endif
+						let diff -= node.length
+					endif
+
+					" Drop overrun node by moving to the next terminal
 					let node = PopLookahead(node)
-					while !IsTerminal(node.symbol)
-						let node = LeftBreakdown(node)
-					endwhile
+					while !IsTerminal(node.symbol) | let node = LeftBreakdown(node) | endwhile
+					let need_new_node = 0
 				endwhile
 
 				if symbol == eof
 					let new_node = eos
 				elseif symbol == node.symbol " If node reuse is possible
 					echom ' Reusing node! oldlen: ' .. node.length
+					let diff -= node.length
 					let node.length = length | let node.modified = 0
 					let need_new_node = 1
 					let new_node = node
@@ -495,27 +499,10 @@ function! s:IncParse(lang, node) abort
 					if node->has_key('parent') | let new_node.parent = node.parent | endif
 				endif
 				if first | let la = new_node | else | let prev.right_sibling = new_node | endif
-				let diff += length
-
-				" TODO Is this legal?
-				while diff >= node.length
-					if node.symbol == eof | break | endif " XXX: Hack!
-					let need_new_node = 0
-					" Drop nodes that have been overrun
-					let diff -= node.length
-					" Move to the next terminal
-					let node = PopLookahead(node)
-					while !IsTerminal(node.symbol)
-						let node = LeftBreakdown(node)
-					endwhile
-				endwhile
 
 				echom 'Diff is ' .. diff
 				if diff == 0 | break | endif " If synced up, break
 				let first = 0 | let prev = new_node
-
-				let cycles += 1
-				if cycles > 7 | throw 'Infinite relexing?' | endif
 			endwhile
 		endfunction
 
@@ -540,6 +527,7 @@ function! s:IncParse(lang, node) abort
 					elseif action.type == 'accept'
 						if la is eos
 							echom 'Parsed successfully!!'
+							let b:node = stack.pop()
 							return
 						else | call Recover() | endif
 					elseif action.type == 'shift'
