@@ -15,6 +15,7 @@ scriptversion 3
 " TODO add accept
 " Count on ~10x more productions than symbols
 " const [s:shift, s:reduce, s:error] = [0x8000, 0x4000, 0x2000]
+const s:error_sym = -1 " The builtin nonterminal error symbol.
 
 " Returns the parse tables for the specified LR(0) grammar.
 "
@@ -189,6 +190,7 @@ function! InitLanguage(grammar, regexes) abort
 	let num_terminals = num_symbols - num_non_terminals
 	let symbol_to_name = s:ReverseDict(symbol_map)
 	let symbol_to_name[eof] = '$'
+	let symbol_to_name[s:error_sym] = 'ERR'
 
 	let tables = s:BuildTables(grammar, num_non_terminals, num_symbols, eof)
 
@@ -380,31 +382,25 @@ function! s:IncParse(lang, node) abort
 			let [state, node] = remove(self.stack, -2, -1)
 			return node
 		endfunction
-		let root = #{symbol: -3}
-		let bos = #{symbol: -1, length: 0, parent: root, right_sibling: a:node}
-		let eos = #{symbol: a:lang.eof, length: 0, parent: root}
-		let a:node.parent = root | let a:node.right_sibling = eos
-		let root.first_child = bos
-		let state = 0 | call stack.push(bos)
-
-		" let la = PopLookahead(bos) " Set lookahead to root of tree
-		let la = a:node
+		function stack.is_empty() abort
+			return self.stack->empty()
+		endfunction
+		let eos = #{symbol: a:lang.eof, length: 0}
+		let state = 0 | let la = a:node " Set lookahead to root of tree
 		let offset = 0 " Byte offset for lexing
 
 		" Decompose a nonterminal lookahead.
 		function! LeftBreakdown(la) abort closure
-			return has_key(a:la, 'first_child') ? a:la.first_child : PopLookahead(a:la)
+			return a:la->has_key('first_child') ? a:la.first_child : PopLookahead(a:la)
 		endfunction
 		" Pop right stack by traversing previous tree structure.
 		function! PopLookahead(la) abort closure
 			let node = a:la
 			echom 'Start of PopLookahead'
-			if node.symbol == eof | throw 'thest' |endif
 			while !has_key(node, 'right_sibling')
 				echom 'PopLookahead: node: ' .. node.symbol
 				if !has_key(node, 'parent') | return eos | endif
 				let node = node.parent
-				if node is root | return eos | endif
 			endwhile
 			return node.right_sibling
 		endfunction
@@ -439,9 +435,12 @@ function! s:IncParse(lang, node) abort
 			let L = action.arity
 			let parent = #{symbol: action.lhs, length: 0} " TODO Reuse parent
 			let last_child = {}
-			" TODO Use last child to check for prev parent
-			for i in range(L)
+			while L > 0 || stack.stack->get(-1, eos).symbol == s:error_sym
 				let child = stack.pop()
+				if child.symbol != s:error_sym
+					let L -= 1
+				endif
+				echom 'Child symbol: ' .. g:lang.symbol_to_name[child.symbol]
 				let child.parent = parent
 				let parent.length += child.length
 				if last_child != {}
@@ -450,7 +449,7 @@ function! s:IncParse(lang, node) abort
 					if child->has_key('right_sibling') | unlet! child.right_sibling | endif
 				endif
 				let last_child = child
-			endfor
+			endwhile
 			let parent.first_child = child
 			let parent.modified = 0
 
@@ -506,6 +505,68 @@ function! s:IncParse(lang, node) abort
 			endwhile
 		endfunction
 
+		" Simple panic mode error recovery.
+		"
+		" Returns a truthy value if should accept.
+		function! Recover() abort closure
+			let save_stack = deepcopy(stack)
+
+			let popped = []
+			while !stack.is_empty()
+				eval popped->add(stack.pop())
+				echom 'Error recovery, testting state: ' .. state
+				let action = actions[state][la.symbol - num_non_terminals]
+				if !(type(action) == v:t_string && action == 'error')
+					" Wrap popped stack nodes into error node and push it onto
+					" the stack
+					let error_node = #{symbol: s:error_sym, length: 0}
+					let last_node = {}
+					for node in popped->reverse()
+						let node.parent = error_node
+						let error_node.length += node.length
+					endfor
+					for i in range(popped->len() - 1)
+						let popped[i].right_sibling = popped[i + 1]
+					endfor
+					if popped[-1]->has_key('right_sibling')
+						unlet! popped[-1].right_sibling
+					endif
+					let error_node.first_child = popped[0]
+					call stack.push(error_node)
+					return
+				endif
+			endwhile
+
+			let stack = save_stack
+
+			if la.symbol == eof
+				" Wrap everything in error node
+				let error_node = #{symbol: s:error_sym, length: 0}
+				let last_child = {}
+				while !(stack.stack->empty())
+					let child = stack.pop()
+					let child.parent = error_node
+					let error_node.length += child.length
+					if last_child != {}
+						let child.right_sibling = last_child
+					else
+						if child->has_key('right_sibling') | unlet! child.right_sibling | endif
+					endif
+					let last_child = child
+				endwhile
+				let error_node.first_child = child
+				call stack.push(error_node)
+				return 1
+			endif
+
+			" Wrap lookahead in error node and push to stack
+
+			let error_node = #{symbol: s:error_sym, length: la.length, first_child: la}
+			let la = PopLookahead(la)
+			if error_node.first_child->has_key('right_sibling') | unlet! error_node.first_child.right_sibling | endif
+			call stack.push(error_node)
+		endfunction
+
 		while 1
 			echomsg 'Lookahead is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0)
 			if IsTerminal(la.symbol)
@@ -522,20 +583,17 @@ function! s:IncParse(lang, node) abort
 					let action = actions[state][la.symbol - num_non_terminals]
 					echomsg 'Nondirty terminal: ' .. la.symbol .. ' Doing action: ' .. string(action)
 
-					if type(action) == v:t_string && action == 'error'
-						call Recover()
-					elseif action.type == 'accept'
-						if la is eos
-							echom 'Parsed successfully!!'
-							let b:node = stack.pop()
-							return
-						else | call Recover() | endif
-					elseif action.type == 'shift'
+					if type(action) != v:t_string && action.type == 'shift'
 						call Shift(la)
 						let offset += la.length
 						let la = PopLookahead(la)
-					elseif action.type == 'reduce'
+					elseif type(action) != v:t_string && action.type == 'reduce'
 						call Reduce(action)
+					elseif type(action) != v:t_string && action.type == 'accept' && la.symbol is# eof
+								\ || Recover()
+						echom 'Parsed successfully!!'
+						let b:node = stack.pop()
+						break
 					endif
 				endif
 			else " This is a nonterminal lookahead
@@ -552,7 +610,7 @@ function! s:IncParse(lang, node) abort
 						else | break | endif
 					endwhile
 
-					let shiftable = goto[state][la.symbol] isnot -1
+					let shiftable = goto[state]->get(la.symbol, -1) isnot -1
 					echom 'Shiftable nonterminal?: ' .. string(shiftable)
 					if shiftable
 						" Place lookahead on stack with its right-hand edge removed
@@ -566,6 +624,8 @@ function! s:IncParse(lang, node) abort
 endfunction
 
 function! s:Listener(bufnr, start, end, added, changes) abort
+	if !exists('b:node') | return | endif
+
 	" Create appropriate edit structure
 	let old_len = b:node.length
 	let new_len = line2byte(line('$') + 1) - 1
@@ -579,7 +639,6 @@ function! s:Listener(bufnr, start, end, added, changes) abort
 	echomsg 'lines ' .. a:start .. ' until ' .. a:end .. ' changed; added: ' .. a:added
 				\ .. ', edit: ' .. string(edit)
 
-	if type(b:node) == v:t_number && b:node == v:null | return | endif
 	call s:EditRanges(b:node, edit) " Adjust node ranges
 endfunction
 
