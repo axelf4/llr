@@ -3,8 +3,6 @@
 "
 " Then use `listener_add()` and the autocmd events BufReadPost and BufUnload
 "
-" Have to have great error recovery...
-"
 " See:
 " * https://pages.github-dev.cs.illinois.edu/cs421-haskell/web-su19/files/handouts/lr-parsing-tables.pdf
 " * https://dl.acm.org.sci-hub.tw/citation.cfm?id=357066
@@ -95,15 +93,12 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 
 	let i = 0
 	for state in states
-		call add(actions, map(range(len(terminals)), '"error"'))
+		call add(actions, map(range(a:num_symbols), '"error"'))
 		call add(goto, map(range(a:num_symbols), -1))
 
 		for edge in edges[i]
 			let goto[i][edge.symbol] = edge.to " Goto to that state
-			if IsTerminal(edge.symbol)
-				" Transition to another State using a Terminal Symbol is a shift to that State
-				let actions[i][edge.symbol - a:num_non_terminals] = {'type': 'shift', 'next': edge.to}
-			endif
+			let actions[i][edge.symbol] = {'type': 'shift', 'next': edge.to}
 		endfor
 
 		" Given a final A-item for production P (A != S') fill corresponding
@@ -112,19 +107,19 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 			let A = item.production.lhs
 			if item.cursor != len(item.production.rhs) || A == -1 | continue | endif
 
-			for t in terminals
-				let prev_action = actions[i][t - a:num_non_terminals]
+			for s in range(a:num_symbols)
+				let prev_action = actions[i][s]
 				" Automatically fix Shift-Reduce Conflicts by not reducing when it would cause a conflict
 				if type(prev_action) != v:t_string || prev_action != 'error' | continue | endif
 
-				let actions[i][t - a:num_non_terminals] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
+				let actions[i][s] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
 			endfor
 		endfor
 
 		" For every item set containing S' → w•eof, set accept in eof column
 		for item in state
 			if item.production.lhs == -1 && item.production.rhs->get(item.cursor, -1) == a:eof
-				let actions[i][a:eof - a:num_non_terminals] = {'type': 'accept'}
+				let actions[i][a:eof] = {'type': 'accept'}
 				break
 			endif
 		endfor
@@ -246,65 +241,6 @@ function! InitLanguage(grammar, regexes) abort
 				\ }
 endfunction
 
-function! Parse(lang) abort
-	let save_cursor = getcurpos()
-	try
-		call cursor(1, 1)
-
-		let actions = a:lang.tables.actions | let goto = a:lang.tables.goto
-		let lexer = a:lang.lexer
-		let num_non_terminals = a:lang.num_non_terminals
-
-		" let lex = lexer.new('i=i+i;i')
-		let lex = lexer.new()
-		let bos = -1 " Symbol for bottom of stack
-		let node = {'symbol': bos, 'state': 0}
-		let [t, length] = lex.advance()
-
-		while v:true
-			let s = node.state
-
-			let action = actions[s][t - num_non_terminals]
-
-			echomsg 'Doing action: ' .. string(action)
-
-			if type(action) == v:t_string && action == 'error'
-				" Error
-				echomsg 'Error: stack: ' .. string(node)
-				throw 'Bad input'
-			elseif action.type == 'accept'
-				" Finished successfully
-				echomsg 'Success: stack: ' .. string(node)
-				break
-			elseif action.type == 'shift'
-				let node = #{symbol: t, state: action.next, predecessor: node, length: length}
-				let [t, length] = lex.advance() " Scan the next input symbol into the lookahead buffer
-			elseif action.type == 'reduce'
-				let L = action.arity
-				let parent = {'symbol': action.lhs, 'length': 0}
-				let last_child = {}
-				for i in range(L)
-					let child = node
-					let child.parent = parent
-					let parent.length += child.length
-					if last_child != {}
-						let child.right_sibling = last_child
-					endif
-					let last_child = child
-
-					let node = child.predecessor
-				endfor
-				let parent.first_child = child
-				let parent.predecessor = node
-				let parent.state = goto[node.state][action.lhs]
-				let node = parent
-			endif
-		endwhile
-
-		return node
-	finally | call setpos('.', save_cursor) | endtry
-endfunction
-
 " List of productions
 let s:grammar = [
 			\ {'lhs': 'S', 'rhs': ['S', ';', 'A']},
@@ -353,6 +289,7 @@ function! s:IncParse(lang, node) abort
 		endfunction
 		let eos = #{symbol: a:lang.eof, length: 0}
 		let state = 0 | let la = a:node " Set lookahead to root of tree
+		let verifying = 0
 		let offset = 0 " Byte offset for lexing
 		echom 'Length: ' .. a:node.length
 
@@ -485,7 +422,7 @@ function! s:IncParse(lang, node) abort
 			while !stack.is_empty()
 				eval popped->add(stack.pop())
 				if IsTransparent(popped[-1].symbol) | continue | endif
-				let action = actions[state][la.symbol - num_non_terminals]
+				let action = actions[state][la.symbol]
 				if !(type(action) == v:t_string && action == 'error')
 					" Wrap popped stack nodes into error node and push it onto
 					" the stack
@@ -539,50 +476,36 @@ function! s:IncParse(lang, node) abort
 
 		while 1
 			echomsg 'Lookahead is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0) .. ', length: ' .. la.length
-			if IsTerminal(la.symbol)
-				if get(la, 'modified', 0)
-					call Relex()
-				else
-					let action = actions[state][la.symbol - num_non_terminals]
-					echomsg '  Nondirty terminal; Doing action: ' .. string(action)
 
-					if type(action) != v:t_string && action.type == 'shift'
-						call Shift(la)
-						let offset += la.length
-						let la = PopLookahead(la)
-					elseif type(action) != v:t_string && action.type == 'reduce'
-						call Reduce(action)
-					elseif type(action) != v:t_string && action.type == 'accept' && stack.size() is 1
-								\ || Recover()
-						break
-					endif
-				endif
-			else " This is a nonterminal lookahead
-				if get(la, 'modified', 0)
-					let la = LeftBreakdown(la) " Split tree at changed points
-				else
-					" Perform all reductions possible
-					" Reductions can only be processed with a terminal lookahead
-					let next_terminal = eof " Legal since LR(0) grammar
-					while 1
-						let action = actions[state][next_terminal - num_non_terminals]
-						if type(action) == v:t_dict && action.type == 'reduce'
-							call Reduce(action)
-						else | break | endif
-					endwhile
+			if la->get('modified', 0)
+				if IsTerminal(la.symbol) | call Relex()
+				else | let la = LeftBreakdown(la) | endif " Split at changed point
+				continue
+			endif
 
-					let shiftable = goto[state]->get(la.symbol, -1) isnot -1
-					if shiftable
-						" Place lookahead on stack with its right-hand edge removed
-						let offset += la.length
-						call Shift(la) | call RightBreakdown() | let la = PopLookahead(la)
-					else | let la = LeftBreakdown(la) | endif
-				endif
+			let action = actions[state][la.symbol]
+			if type(action) != v:t_string && action.type == 'shift'
+				let verifying = !IsTerminal(la.symbol)
+				call Shift(la)
+				let offset += la.length
+				let la = PopLookahead(la)
+			elseif type(action) != v:t_string && action.type == 'reduce'
+				call Reduce(action)
+			elseif type(action) == v:t_string && action == 'error'
+				if IsTerminal(la.symbol)
+					if verifying
+						call RightBreakdown() " Delayed breakdown
+						let verifying = 0
+					else | call Recover() | endif " Actual parse error
+				else | let la = LeftBreakdown(la) | endif
+			elseif type(action) != v:t_string && action.type == 'accept' && stack.size() is 1
+						\ || Recover()
+				break
 			endif
 		endwhile
-	finally | call setpos('.', save_cursor) | endtry
 
-	return stack.pop()
+		return stack.pop()
+	finally | call setpos('.', save_cursor) | endtry
 endfunction
 
 " Adjust the byte lengths of the specified node given an edit.
@@ -638,12 +561,6 @@ function! s:Listener(bufnr, start, end, added, changes) abort
 
 	call s:EditRanges(b:node, edit) " Adjust node ranges
 	call IncParseBuffer()
-endfunction
-
-function! ParseBuffer() abort
-	let b:node = Parse(g:lang)
-
-	return b:node
 endfunction
 
 function! ResetTree() abort
