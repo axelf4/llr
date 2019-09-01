@@ -65,7 +65,6 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	" To generate the first item set, take the closure of the item S' -> •S
 	let S = 0 " Assume that the start state has id 0
 	let initial_item_set = Closure([#{production: #{lhs: -1, rhs: [S, a:eof]}, cursor: 0}])
-	" echomsg 'Initial item set: ' .. string(initial_item_set)
 	let states = [initial_item_set] " Map from state index to associated closure
 	let edges = []
 	let n = 0
@@ -144,7 +143,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		echomsg '' .. n .. ' | ' .. string(goto[n])
 	endfor
 
-	return #{ actions: actions, goto: goto, }
+	return #{actions: actions, goto: goto}
 endfunction
 
 " Converts string names for symbols in the grammar to numerical ids.
@@ -170,10 +169,8 @@ function! s:ExtractSymbols(grammar) abort
 		call map(production.rhs, {k, v -> ToId(v)})
 	endfor
 
-	let eof = next_id
-	let num_symbols = next_id + 1
-
-	return [a:grammar, extracted_symbols, num_non_terminals, num_symbols, eof]
+	let etoken = next_id | let eof = next_id + 1 | let num_symbols = next_id + 2
+	return [a:grammar, extracted_symbols, num_non_terminals, num_symbols, etoken, eof]
 endfunction
 
 function! s:ReverseDict(dict) abort
@@ -186,18 +183,19 @@ endfunction
 
 " Constructs a language object from the specified grammar/regexes.
 function! InitLanguage(grammar, regexes) abort
-	let [grammar, symbol_map, num_non_terminals, num_symbols, eof] = s:ExtractSymbols(a:grammar)
+	let [grammar, symbol_map, num_non_terminals, num_symbols, etoken, eof] = s:ExtractSymbols(a:grammar)
 	let num_terminals = num_symbols - num_non_terminals
 	let symbol_to_name = s:ReverseDict(symbol_map)
 	let symbol_to_name[eof] = '$'
+	let symbol_to_name[etoken] = "LEXERR"
 	let symbol_to_name[s:error_sym] = 'ERR'
 
 	let tables = s:BuildTables(grammar, num_non_terminals, num_symbols, eof)
 
 	" Build lexer regex pattern
-	if len(a:regexes) isnot num_terminals - 1 | throw 'Bad number of terminal regexes' | endif
-	let pattern = '\(' .. a:regexes->items()->sort({a, b -> symbol_map[a[0]] - symbol_map[b[0]]})
-				\ ->map({i, v -> v[1]})->join('\)\|\(') .. '\)'
+	if len(a:regexes) isnot num_terminals - 2 | throw 'Bad number of terminal regexes' | endif
+	let pattern = '\%#\(' .. a:regexes->items()->sort({a, b -> symbol_map[a[0]] - symbol_map[b[0]]})
+				\ ->map({i, v -> v[1]})->join('\)\|\(') .. '\)\|\(.\+\)'
 	echom 'Lexer pattern: ' .. pattern
 
 	let lexer = {}
@@ -221,11 +219,13 @@ function! InitLanguage(grammar, regexes) abort
 		" TODO Position cursor on char before and don't accept match at cursor
 		" pos instead
 		let [lnum, col, submatch] = searchpos(pattern, 'cepWz')
-		if submatch <= 1
-			echoerr 'Lexing: Invalid token'
-		endif
 		let byte = line2byte(lnum) - 1 + col
+		let prev_lnum = line('.')
 		silent execute "normal! 1\<Space>"
+		if submatch <= 1 " No match
+			if prev_lnum == line('$') | let self.has_eof = 1 | endif
+			return [etoken, 1]
+		endif
 		let [bufnum, nlnum, ncol; rest] = getcurpos()
 		" If cursor stayed in place it has reached EOF
 		if nlnum == lnum && ncol == col | let self.has_eof = 1 | endif
@@ -241,7 +241,7 @@ function! InitLanguage(grammar, regexes) abort
 
 	return #{
 				\ tables: tables, lexer: lexer,
-				\ num_non_terminals: num_non_terminals, eof: eof,
+				\ num_non_terminals: num_non_terminals, eof: eof, etoken: etoken,
 				\ symbol_to_name: symbol_to_name,
 				\ }
 endfunction
@@ -325,43 +325,6 @@ let s:regexes = {
 let v:errors = []
 let lang = InitLanguage(s:grammar, s:regexes)
 
-" Adjust the byte lengths of the specified node given an edit.
-"
-" Should be done before re-parsing. The edit must be entirely contained inside
-" node. {edit} may be modified in-place.
-function! s:EditRanges(node, edit) abort
-	" Validate edit range
-	if a:edit.start < 0 || a:edit.old_end > a:node.length
-		throw 'Edit is outside this node'
-	endif
-
-	let a:node.modified = 1
-	" Enlarge according to edit length difference
-	let a:node.length += a:edit.new_end - a:edit.old_end
-
-	" Edit child ranges
-	let child = get(a:node, 'first_child', v:null)
-	while type(child) != v:t_string && child isnot# v:null
-		let old_child_length = child.length " Store child len before it might change
-		if a:edit.start <= child.length
-			let child_edit = copy(a:edit)
-			if child_edit.old_end > child.length | let child_edit.old_end = child.length | endif
-			call s:EditRanges(child, child_edit) " Recurse
-
-			let a:edit.new_end = 0 " Distribute all new len to first child
-		else
-			let a:edit.new_end -= child.length
-		endif
-
-		let a:edit.start -= old_child_length
-		if a:edit.start < 0 | let a:edit.start = 0 | endif
-		let a:edit.old_end -= old_child_length
-		if a:edit.old_end <= 0 | break | endif
-
-		let child = get(child, 'right_sibling', v:null)
-	endwhile
-endfunction
-
 function! s:IncParse(lang, node) abort
 	let save_cursor = getcurpos()
 	try
@@ -369,7 +332,7 @@ function! s:IncParse(lang, node) abort
 
 		let actions = a:lang.tables.actions | let goto = a:lang.tables.goto
 		let num_non_terminals = a:lang.num_non_terminals
-		let eof = a:lang.eof
+		let eof = a:lang.eof | let etoken = a:lang.etoken
 		let IsTerminal = {symbol -> symbol >= num_non_terminals}
 
 		let lex = a:lang.lexer.new()
@@ -382,12 +345,16 @@ function! s:IncParse(lang, node) abort
 			let [state, node] = remove(self.stack, -2, -1)
 			return node
 		endfunction
+		function stack.size() abort
+			return self.stack->len() / 2
+		endfunction
 		function stack.is_empty() abort
 			return self.stack->empty()
 		endfunction
 		let eos = #{symbol: a:lang.eof, length: 0}
 		let state = 0 | let la = a:node " Set lookahead to root of tree
 		let offset = 0 " Byte offset for lexing
+		echom 'Length: ' .. a:node.length
 
 		" Decompose a nonterminal lookahead.
 		function! LeftBreakdown(la) abort closure
@@ -396,9 +363,7 @@ function! s:IncParse(lang, node) abort
 		" Pop right stack by traversing previous tree structure.
 		function! PopLookahead(la) abort closure
 			let node = a:la
-			echom 'Start of PopLookahead'
 			while !has_key(node, 'right_sibling')
-				echom 'PopLookahead: node: ' .. node.symbol
 				if !has_key(node, 'parent') | return eos | endif
 				let node = node.parent
 			endwhile
@@ -431,13 +396,15 @@ function! s:IncParse(lang, node) abort
 			call Shift(node) " Leave final terminal symbol on top of stack
 		endfunction
 
+		let IsTransparent = {symbol -> symbol == s:error_sym || symbol == etoken}
+
 		function! Reduce(action) abort closure
 			let L = action.arity
 			let parent = #{symbol: action.lhs, length: 0} " TODO Reuse parent
 			let last_child = {}
-			while L > 0 || stack.stack->get(-1, eos).symbol == s:error_sym
+			while L > 0 || IsTransparent(stack.stack->get(-1, eos).symbol)
 				let child = stack.pop()
-				if child.symbol != s:error_sym
+				if !IsTransparent(child.symbol)
 					let L -= 1
 				endif
 				echom 'Child symbol: ' .. g:lang.symbol_to_name[child.symbol]
@@ -447,6 +414,10 @@ function! s:IncParse(lang, node) abort
 					let child.right_sibling = last_child
 				else
 					if child->has_key('right_sibling') | unlet! child.right_sibling | endif
+					if child->has_key('parent')
+						if child.parent->has_key('parent') | let parent.parent = child.parent.parent | endif
+						if child.parent->has_key('right_sibling') | let parent.parent = child.parent.right_sibling | endif
+					endif
 				endif
 				let last_child = child
 			endwhile
@@ -499,7 +470,6 @@ function! s:IncParse(lang, node) abort
 				endif
 				if first | let la = new_node | else | let prev.right_sibling = new_node | endif
 
-				echom 'Diff is ' .. diff
 				if diff == 0 | break | endif " If synced up, break
 				let first = 0 | let prev = new_node
 			endwhile
@@ -509,12 +479,12 @@ function! s:IncParse(lang, node) abort
 		"
 		" Returns a truthy value if should accept.
 		function! Recover() abort closure
-			let save_stack = deepcopy(stack)
+			let [save_state, save_stack] = [state, deepcopy(stack)]
 
 			let popped = []
 			while !stack.is_empty()
 				eval popped->add(stack.pop())
-				echom 'Error recovery, testting state: ' .. state
+				if IsTransparent(popped[-1].symbol) | continue | endif
 				let action = actions[state][la.symbol - num_non_terminals]
 				if !(type(action) == v:t_string && action == 'error')
 					" Wrap popped stack nodes into error node and push it onto
@@ -537,7 +507,7 @@ function! s:IncParse(lang, node) abort
 				endif
 			endwhile
 
-			let stack = save_stack
+			let state = save_state | let stack = save_stack
 
 			if la.symbol == eof
 				" Wrap everything in error node
@@ -554,34 +524,27 @@ function! s:IncParse(lang, node) abort
 					endif
 					let last_child = child
 				endwhile
-				let error_node.first_child = child
+				if exists('child') | let error_node.first_child = child | endif
 				call stack.push(error_node)
 				return 1
 			endif
 
 			" Wrap lookahead in error node and push to stack
-
 			let error_node = #{symbol: s:error_sym, length: la.length, first_child: la}
-			let la = PopLookahead(la)
+			let la = PopLookahead(la) " Advance la before changing its parent/siblings!
+			let error_node.first_child.parent = error_node
 			if error_node.first_child->has_key('right_sibling') | unlet! error_node.first_child.right_sibling | endif
 			call stack.push(error_node)
 		endfunction
 
 		while 1
-			echomsg 'Lookahead is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0)
+			echomsg 'Lookahead is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0) .. ', length: ' .. la.length
 			if IsTerminal(la.symbol)
 				if get(la, 'modified', 0)
 					call Relex()
-					echomsg ' After relex'
-					let child = la
-					while 1
-						echomsg 'Child: ' .. g:lang.symbol_to_name[child.symbol] .. ' len: ' .. child.length
-						if !has_key(child, 'right_sibling') | break | endif
-						let child = child.right_sibling
-					endwhile
 				else
 					let action = actions[state][la.symbol - num_non_terminals]
-					echomsg 'Nondirty terminal: ' .. la.symbol .. ' Doing action: ' .. string(action)
+					echomsg '  Nondirty terminal; Doing action: ' .. string(action)
 
 					if type(action) != v:t_string && action.type == 'shift'
 						call Shift(la)
@@ -589,10 +552,8 @@ function! s:IncParse(lang, node) abort
 						let la = PopLookahead(la)
 					elseif type(action) != v:t_string && action.type == 'reduce'
 						call Reduce(action)
-					elseif type(action) != v:t_string && action.type == 'accept' && la.symbol is# eof
+					elseif type(action) != v:t_string && action.type == 'accept' && stack.size() is 1
 								\ || Recover()
-						echom 'Parsed successfully!!'
-						let b:node = stack.pop()
 						break
 					endif
 				endif
@@ -611,7 +572,6 @@ function! s:IncParse(lang, node) abort
 					endwhile
 
 					let shiftable = goto[state]->get(la.symbol, -1) isnot -1
-					echom 'Shiftable nonterminal?: ' .. string(shiftable)
 					if shiftable
 						" Place lookahead on stack with its right-hand edge removed
 						let offset += la.length
@@ -621,6 +581,45 @@ function! s:IncParse(lang, node) abort
 			endif
 		endwhile
 	finally | call setpos('.', save_cursor) | endtry
+
+	return stack.pop()
+endfunction
+
+" Adjust the byte lengths of the specified node given an edit.
+"
+" Should be done before re-parsing. The edit must be entirely contained inside
+" node. {edit} may be modified in-place.
+function! s:EditRanges(node, edit) abort
+	" Validate edit range
+	if a:edit.start < 0 || a:edit.old_end > a:node.length
+		throw 'Edit is outside this node'
+	endif
+
+	let a:node.modified = 1
+	" Enlarge according to edit length difference
+	let a:node.length += a:edit.new_end - a:edit.old_end
+
+	" Edit child ranges
+	let child = get(a:node, 'first_child', v:null)
+	while type(child) != v:t_string && child isnot# v:null
+		let old_child_length = child.length " Store child len before it might change
+		if a:edit.start <= child.length
+			let child_edit = copy(a:edit)
+			if child_edit.old_end > child.length | let child_edit.old_end = child.length | endif
+			call s:EditRanges(child, child_edit) " Recurse
+
+			let a:edit.new_end = 0 " Distribute all new len to first child
+		else
+			let a:edit.new_end -= child.length
+		endif
+
+		let a:edit.start -= old_child_length
+		if a:edit.start < 0 | let a:edit.start = 0 | endif
+		let a:edit.old_end -= old_child_length
+		if a:edit.old_end <= 0 | break | endif
+
+		let child = get(child, 'right_sibling', v:null)
+	endwhile
 endfunction
 
 function! s:Listener(bufnr, start, end, added, changes) abort
@@ -636,23 +635,28 @@ function! s:Listener(bufnr, start, end, added, changes) abort
 				\ new_end: new_end,
 				\ old_end: new_end + (old_len - new_len),
 				\ }
-	echomsg 'lines ' .. a:start .. ' until ' .. a:end .. ' changed; added: ' .. a:added
-				\ .. ', edit: ' .. string(edit)
 
 	call s:EditRanges(b:node, edit) " Adjust node ranges
+	call IncParseBuffer()
 endfunction
 
 function! ParseBuffer() abort
 	let b:node = Parse(g:lang)
 
-	if exists('b:listener_id') | call listener_remove(b:listener_id) | endif
-	let b:listener_id = listener_add(funcref('s:Listener'))
-
 	return b:node
 endfunction
 
+function! ResetTree() abort
+	if exists('b:listener_id') | call listener_remove(b:listener_id) | endif
+	let b:listener_id = listener_add(funcref('s:Listener'))
+
+	let b:node = #{symbol: g:lang.etoken, length: line2byte(line('$') + 1) - 1,
+				\ modified: 1}
+endfunction
+
 function! IncParseBuffer() abort
-	return s:IncParse(g:lang, b:node)
+	let b:node = s:IncParse(g:lang, b:node)
+	return b:node
 endfunction
 
 function! GetSyntaxNode(lnum, col) abort
@@ -660,19 +664,16 @@ function! GetSyntaxNode(lnum, col) abort
 	let node = b:node
 	let stack = [node]
 	let offset = 0
-	echom 'Root len: ' .. node.length
 
-	while has_key(node, 'first_child')
+	while node->has_key('first_child')
 		" Output debug information
 		echomsg 'Top level: -------'
-		if has_key(node, 'first_child')
-			let child = node.first_child
-			while 1
-				echomsg 'Child: ' .. g:lang.symbol_to_name[child.symbol] .. ' len: ' .. child.length
-				if !has_key(child, 'right_sibling') | break | endif
-				let child = child.right_sibling
-			endwhile
-		endif
+		let child = node
+		while 1
+			echomsg 'Child: ' .. g:lang.symbol_to_name[child.symbol] .. ' len: ' .. child.length
+			if !has_key(child, 'right_sibling') | break | endif
+			let child = child.right_sibling
+		endwhile
 
 		let node = node.first_child
 		while offset + node.length < byte
@@ -690,11 +691,14 @@ function! GetSyntaxNodeUnderCursor() abort
 	return GetSyntaxNode(line('.'), col('.'))
 endfunction
 
-" On the topic of DS for storing node span information:
-"
-" Don't really want to store lnum since would have to update all when lines
-" are added/removed
-"
-" For that reason just storing byte length is probably nicest
+function! PrintTree(node, depth) abort
+	echom repeat(' ', 4 * a:depth) .. g:lang.symbol_to_name[a:node.symbol] .. a:node.length
+	if a:node->has_key('first_child')
+		call PrintTree(a:node.first_child, a:depth + 1)
+	endif
+	if a:node->has_key('right_sibling')
+		call PrintTree(a:node.right_sibling, a:depth)
+	endif
+endfunction
 
 for error in v:errors | echoerr error | endfor
