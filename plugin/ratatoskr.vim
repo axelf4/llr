@@ -98,7 +98,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 
 		for edge in edges[i]
 			let goto[i][edge.symbol] = edge.to " Goto to that state
-			let actions[i][edge.symbol] = {'type': 'shift', 'next': edge.to}
+			let actions[i][edge.symbol] = {'type': 'shift'}
 		endfor
 
 		" Given a final A-item for production P (A != S') fill corresponding
@@ -273,7 +273,7 @@ function! s:IncParse(lang, node) abort
 
 		let lex = a:lang.lexer.new()
 		" Initialize the parse stack to contain only bos
-		let stack = #{stack: []}
+		let stack = #{stack: []} " Stores [beginning_state, node]
 		function stack.push(node) abort closure
 			call extend(self.stack, [state, a:node])
 		endfunction
@@ -513,35 +513,37 @@ endfunction
 " Should be done before re-parsing. The edit must be entirely contained inside
 " node. {edit} may be modified in-place.
 function! s:EditRanges(node, edit) abort
-	" Validate edit range
-	if a:edit.start < 0 || a:edit.old_end > a:node.length
-		throw 'Edit is outside this node'
-	endif
+	let stack = [a:node, a:edit]
 
-	let a:node.modified = 1
-	" Enlarge according to edit length difference
-	let a:node.length += a:edit.new_end - a:edit.old_end
+	while !empty(stack)
+		let [node, edit] = stack->remove(-2, -1)
+		let node.modified = 1
+		" Enlarge according to edit length difference
+		let node.length += edit.new_end - edit.old_end
 
-	" Edit child ranges
-	let child = get(a:node, 'first_child', v:null)
-	while type(child) != v:t_string && child isnot# v:null
-		let old_child_length = child.length " Store child len before it might change
-		if a:edit.start <= child.length
-			let child_edit = copy(a:edit)
-			if child_edit.old_end > child.length | let child_edit.old_end = child.length | endif
-			call s:EditRanges(child, child_edit) " Recurse
+		" Edit child ranges
+		if node->has_key('first_child')
+			let child = node.first_child
+			while 1
+				if edit.start <= child.length
+					let child_edit = copy(edit)
+					if child_edit.old_end > child.length | let child_edit.old_end = child.length | endif
+					call add(stack, child) | call add(stack, child_edit)
 
-			let a:edit.new_end = 0 " Distribute all new len to first child
-		else
-			let a:edit.new_end -= child.length
+					let edit.new_end = 0 " Distribute all new len to first child
+				else
+					let edit.new_end -= child.length
+				endif
+
+				let edit.old_end -= child.length
+				if edit.old_end <= 0 | break | endif
+				let edit.start -= child.length
+				if edit.start < 0 | let edit.start = 0 | endif
+
+				if !has_key(child, 'right_sibling') | break | endif
+				let child = child.right_sibling
+			endwhile
 		endif
-
-		let a:edit.start -= old_child_length
-		if a:edit.start < 0 | let a:edit.start = 0 | endif
-		let a:edit.old_end -= old_child_length
-		if a:edit.old_end <= 0 | break | endif
-
-		let child = get(child, 'right_sibling', v:null)
 	endwhile
 endfunction
 
