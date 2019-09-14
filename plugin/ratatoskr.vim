@@ -230,7 +230,6 @@ function! InitLanguage(grammar, regexes) abort
 		let symbol = submatch - 2 + num_non_terminals
 		let length = byte - self.offset
 		let self.offset = byte
-		echom 'Lexed symbol: ' .. symbol_to_name[symbol] .. ', length: ' .. length
 		return [symbol, length]
 	endfunction
 
@@ -291,7 +290,6 @@ function! s:IncParse(lang, node) abort
 		let state = 0 | let la = a:node " Set lookahead to root of tree
 		let verifying = 0
 		let offset = 0 " Byte offset for lexing
-		echom 'Length: ' .. a:node.length
 
 		" Decompose a nonterminal lookahead.
 		function! LeftBreakdown(la) abort closure
@@ -344,7 +342,6 @@ function! s:IncParse(lang, node) abort
 				if !IsTransparent(child.symbol)
 					let L -= 1
 				endif
-				echom 'Child symbol: ' .. g:lang.symbol_to_name[child.symbol]
 				let child.parent = parent
 				let parent.length += child.length
 				if last_child != {}
@@ -368,7 +365,6 @@ function! s:IncParse(lang, node) abort
 		" Relex a continuous region of modified nodes.
 		function! Relex() abort closure
 			let cur = lex.set_offset(offset)
-			echom 'Relexing at ' .. string(cur)
 			let node = la
 			let diff = 0 " Cursor offset to start of the current lookahead
 			let need_new_node = 0
@@ -395,13 +391,11 @@ function! s:IncParse(lang, node) abort
 				if symbol == eof
 					let new_node = eos
 				elseif symbol == node.symbol " If node reuse is possible
-					echom ' Reusing node! oldlen: ' .. node.length
 					let diff -= node.length
 					let node.length = length | let node.modified = 0
 					let need_new_node = 1
 					let new_node = node
 				else
-					echom ' Inserting new node before'
 					let new_node = #{symbol: symbol, length: length, right_sibling: node}
 					if node->has_key('parent') | let new_node.parent = node.parent | endif
 				endif
@@ -416,35 +410,31 @@ function! s:IncParse(lang, node) abort
 		"
 		" Returns a truthy value if should accept.
 		function! Recover() abort closure
-			let [save_state, save_stack] = [state, deepcopy(stack)]
-
-			let popped = []
-			while !stack.is_empty()
-				eval popped->add(stack.pop())
-				if IsTransparent(popped[-1].symbol) | continue | endif
-				let action = actions[state][la.symbol]
+			let i = 0
+			while i < stack.size()
+				let stack_state = stack.stack[-2 * (1 + i)] | let stack_node = stack.stack[-2 * i - 1]
+				let i += 1
+				if IsTransparent(stack_node.symbol) | continue | endif
+				let action = actions[stack_state][la.symbol]
 				if !(type(action) == v:t_string && action == 'error')
-					" Wrap popped stack nodes into error node and push it onto
-					" the stack
+					" Pop stack nodes until can continue and wrap them in an error node
 					let error_node = #{symbol: s:error_sym, length: 0}
-					let last_node = {}
-					for node in popped->reverse()
+					for node in range(i)->map({-> stack.pop()})
 						let node.parent = error_node
 						let error_node.length += node.length
+						let error_node.first_child = node
+
+						if exists('last_child')
+							let node.right_sibling = last_child
+						else
+							if node->has_key('right_sibling') | unlet! node.right_sibling | endif
+						endif
+						let last_child = node
 					endfor
-					for i in range(popped->len() - 1)
-						let popped[i].right_sibling = popped[i + 1]
-					endfor
-					if popped[-1]->has_key('right_sibling')
-						unlet! popped[-1].right_sibling
-					endif
-					let error_node.first_child = popped[0]
 					call stack.push(error_node)
 					return
 				endif
 			endwhile
-
-			let state = save_state | let stack = save_stack
 
 			if la.symbol == eof
 				" Wrap everything in error node
@@ -475,8 +465,6 @@ function! s:IncParse(lang, node) abort
 		endfunction
 
 		while 1
-			echomsg 'Lookahead is ' .. g:lang.symbol_to_name[la.symbol] .. ', modified: ' .. la->get('modified', 0) .. ', length: ' .. la.length
-
 			if la->get('modified', 0)
 				if IsTerminal(la.symbol) | call Relex()
 				else | let la = LeftBreakdown(la) | endif " Split at changed point
