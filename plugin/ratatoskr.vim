@@ -54,38 +54,127 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	" Returns Goto(I, X) = Closure({A → aX•b | A -> a•Xb in I}).
 	"
 	" Modifies the specified list in-situ.
-	let Goto = {item_set, x -> item_set->filter({k, v -> v.production.rhs->get(v.cursor, -1) == x})
-				\ ->map({k, v -> extend(v, #{cursor: v.cursor + 1})})->Closure()}
+	let Goto = {item_set, x -> item_set->filter({_, v -> v.production.rhs->get(v.cursor, -1) == x})
+				\ ->map({_, v -> extend(v, #{cursor: v.cursor + 1})})->Closure()}
 
 	" Create the DFA
-
 	" Augment grammar with a production S' -> S, where S is the start symbol
 	" To generate the first item set, take the closure of the item S' -> •S
-	let S = 0 " Assume that the start state has id 0
+	let S = 0 " Assume that the start symbol has id 0
 	let initial_item_set = Closure([#{production: #{lhs: -1, rhs: [S, a:eof]}, cursor: 0}])
-	let states = [initial_item_set] " Map from state index to associated closure
-	let edges = []
+	let states = [#{item_set: initial_item_set, edges: {}}]
 	let n = 0
 	while n < len(states)
 		let state = states[n]
-		call add(edges, [])
-		for item in state
+		for item in state.item_set
 			let x = item.production.rhs->get(item.cursor, -1) " Symbol to the right of dot
 			if x != -1
-				let goto = Goto(deepcopy(state), x)
-				let n_prime = index(states, goto)
+				let goto = Goto(deepcopy(state.item_set), x)
+				" Check if state already exists
+				let n_prime = -1
+				for i in range(len(states))
+					if states[i].item_set == goto
+						let n_prime = i
+						break
+					endif
+				endfor
+				" Otherwise add new state
 				if n_prime == -1
 					let n_prime = len(states)
-					call add(states, goto)
+					call add(states, #{item_set: goto, edges: {}})
 				endif
 
-				" Add an edge X from state n to goto(I, X) state
-				call add(edges[n], {'symbol': x, 'to': n_prime})
+				let state.edges[x] = n_prime " Add an edge X from state n to goto(I, X) state
 			endif
 		endfor
 
 		let n += 1
 	endwhile
+
+	" Dictionary containing all nonterminals that may produce epsilon.
+	let nullable = {}
+	" Compute which nonterminals are nullable (simple O(n^2) algo)
+	let should_continue = 1
+	while should_continue
+		let should_continue = 0
+		for production in a:grammar
+			if nullable->has_key(production.lhs) | continue | endif
+			let is_nullable = 1
+			for X in production.rhs
+				if !(IsNonTerminal(X) && nullable->has_key(X))
+					let is_nullable = 0
+					break
+				endif
+			endfor
+			if is_nullable
+				let should_continue = 1
+				let nullable[production.lhs] = 1
+			endif
+		endfor
+	endwhile
+	let IsNullable = {A -> nullable->has_key(A)}
+
+	" The set of nonterminal transitions of the LR(0) parser
+	let X = {} " TODO: Can this be made a List instead
+	for i in range(len(states))
+		let state = states[i]
+		for transition_symbol in state.edges->keys()->filter({_, X -> IsNonTerminal(str2nr(X))})
+			let X[#{state: i, symbol: transition_symbol}] = 1
+		endfor
+	endfor
+
+	function ToSet(a) abort
+		let result = {}
+		for x in a | let result[a] = 1 | endfor
+		return result
+	endfunction
+
+	" Direct read symbols.
+	"
+	" Returns the terminals as the keys of a Dictionary.
+	let DR = {p, A -> states[states[p].edges[A]].edges->keys()->filter(IsTerminal)->ToSet()}
+
+	let Reads = {p, A -> states[p].edges[A] }
+	function! Reads(p, A) closure abort
+		let r = states[p].edges[A]
+		return states[r].edges->keys()->filter(IsNullable)
+					\ ->map({_, C -> #{state: r, symbol: C}})
+	endfunction
+
+	" Digraph
+	function! Digraph(X, R, FP) abort
+		let stack = []
+		let F = a:X->copy()->map({_, _-> {}}) " Function from X to initially empty sets
+		" let N = range(len(a:X))->map(0)
+		let N = a:X->copy()->map(0)
+
+		function! Traverse(x) closure abort
+			eval stack->add(x)
+			let d = stack->len()
+			let N[x] = d
+			let F[x] = a:FP(x.state, x.symbol)
+
+			for y in R(x.state, x.symbol)
+				if N[y] == 0 | call Traverse(y) | endif
+				if N[y] < N[x] | let N[x] = N[y] | endif
+				eval F[x]->extend(F[y])
+			endfor
+
+			if N[x] == d
+				while 1
+					let N[stack[-1]] = 1/0
+					let F[stack[-1]] = F[x]
+					if stack->remove(-1) is# x | break | endif
+				endwhile
+			endif
+		endfunction
+
+		for x in a:X | if N[x] == 0 | call Traverse(x) | endif | endfor
+
+		return F
+	endfunction
+
+	let Read = Digraph(X, Reads, DR)
 
 	" Build parse tables
 	let actions = [] " Row for each state, column for each terminal
@@ -96,14 +185,14 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		call add(actions, map(range(a:num_symbols), '"error"'))
 		call add(goto, map(range(a:num_symbols), -1))
 
-		for edge in edges[i]
-			let goto[i][edge.symbol] = edge.to " Goto to that state
-			let actions[i][edge.symbol] = {'type': 'shift'}
+		for [symbol, to] in state.edges->items()
+			let goto[i][symbol] = to " Goto to that state
+			let actions[i][symbol] = {'type': 'shift'}
 		endfor
 
 		" Given a final A-item for production P (A != S') fill corresponding
 		" row with reduce action for P
-		for item in state
+		for item in state.item_set
 			let A = item.production.lhs
 			if item.cursor != len(item.production.rhs) || A == -1 | continue | endif
 
@@ -117,7 +206,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		endfor
 
 		" For every item set containing S' → w•eof, set accept in eof column
-		for item in state
+		for item in state.item_set
 			if item.production.lhs == -1 && item.production.rhs->get(item.cursor, -1) == a:eof
 				let actions[i][a:eof] = {'type': 'accept'}
 				break
@@ -161,7 +250,7 @@ function! s:ExtractSymbols(grammar) abort
 	endfor
 	let num_non_terminals = next_id
 	for production in a:grammar
-		call map(production.rhs, {k, v -> ToId(v)})
+		call map(production.rhs, {_, v -> ToId(v)})
 	endfor
 
 	let etoken = next_id | let eof = next_id + 1 | let num_symbols = next_id + 2
@@ -190,7 +279,7 @@ function! InitLanguage(grammar, regexes) abort
 	" Build lexer regex pattern
 	if len(a:regexes) isnot num_terminals - 2 | throw 'Bad number of terminal regexes' | endif
 	let pattern = '\%#\(' .. a:regexes->items()->sort({a, b -> symbol_map[a[0]] - symbol_map[b[0]]})
-				\ ->map({i, v -> v[1]})->join('\)\|\(') .. '\)\|\(.\+\)'
+				\ ->map({_, v -> v[1]})->join('\)\|\(') .. '\)\|\(.\+\)'
 	echom 'Lexer pattern: ' .. pattern
 
 	let lexer = {}
@@ -591,7 +680,7 @@ function! GetSyntaxNode(lnum, col) abort
 	endwhile
 
 	" return stack
-	return string(map(stack, {i, v -> g:lang.symbol_to_name[v.symbol]})) .. ', modified: ' .. node->get('modified', 0) .. ', length: ' .. node.length
+	return string(map(stack, {_, v -> g:lang.symbol_to_name[v.symbol]})) .. ', modified: ' .. node->get('modified', 0) .. ', length: ' .. node.length
 endfunction
 
 function! GetSyntaxNodeUnderCursor() abort
