@@ -116,6 +116,11 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	endwhile
 	let IsNullable = {A -> nullable->has_key(A)}
 
+	" Build the LALR(1) lookahead sets from the LR(0) automata, based on:
+	" DeRemer, F. L., and T. J. Pennelo: "Efficient Computation of LALR(1)
+	" Lookahead Sets", ACM Transactions on Programming Languages and Systems,
+	" Vol. 4, No. 4, Oct. 1982, pp. 615-649
+
 	let X = [] " The set of nonterminal transitions of the LR(0) parser
 	for i in range(len(states))
 		let state = states[i]
@@ -125,7 +130,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		endfor
 	endfor
 
-	function ToSet(a) abort
+	function! ToSet(a) abort
 		let result = {}
 		for x in a:a
 			if type(x) != v:t_string && type(x) != v:t_number | throw 'Bad type' | endif
@@ -136,14 +141,13 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 
 	" Direct read symbols.
 	"
-	" Returns the terminals as the keys of a Dictionary.
-	let DR = {p, A -> states[states[p].edges[A]].edges->keys()->filter({_, v -> IsTerminal(str2nr(v))})->ToSet()}
+	" Returns the symbols as the keys of a Dictionary.
+	let DR = {p, A -> states[states[p].edges[A]].edges->keys()->ToSet()}
 
 	" (p, A) READS (r, C) iff p --A-> r --C-> and C =>* eps
 	let reads = X->copy()->map({_, trans -> states[trans.state].edges[trans.symbol]})
 				\ ->map({_, r -> states[r].edges->keys()->filter({_, C -> IsNullable(C)})
 				\ 	->map({_, C -> X->index(#{state: r, symbol: str2nr(C)})})})
-	echomsg 'reads: ' .. string(reads)
 
 	" (p, A) INCLUDES (p', B) iff B -> L A T,  T =>* eps, and p' --L-> p
 	let includes = repeat([[]], len(X))
@@ -153,12 +157,13 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		for i in range(X->len())
 			let transition = X[i]
 			let state = states[transition.state]
-			let symbol = transition.symbol
+			let B = transition.symbol
 
 			for item in state.item_set
 				" Consider only start B-items
-				if item.production.lhs != symbol || item.cursor != 0 | continue | endif
+				if item.production.lhs != B || item.cursor != 0 | continue | endif
 
+				" Run the state machine forward
 				let j = transition.state
 				for cursor in range(item.cursor, item.production.rhs->len() - 1)
 					let t = item.production.rhs[cursor]
@@ -179,14 +184,12 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 					let j = states[j].edges[t]
 				endfor
 
-				" Here we at end of item
+				" At this point j is the final state
 				eval lookback->add(#{q: j, production: item.production, transition: i})
 			endfor
 		endfor
 	endfunction
 	call CalcIncludesLookback()
-	echom 'includes: ' .. string(includes)
-	echom 'lookback: ' .. string(lookback)
 
 	" Digraph
 	function! Digraph(X, R, FP) abort
@@ -221,10 +224,8 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	endfunction
 
 	let Read = Digraph(X, reads, DR)
-	echom 'Read: ' .. string(Read)
 	let ReadFunc = {p, A -> Read[X->index(#{state: p, symbol: A})]}
 	let Follow = Digraph(X, includes, ReadFunc)
-	echom 'Follow: ' .. string(Follow)
 
 	" LA(q, A -> w) = U{Follow(p, A) | (q, A -> w) lookback (p, A)}
 	function! LA(q, production) closure abort
@@ -234,11 +235,11 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 				eval result->extend(Follow[lb.transition])
 			endif
 		endfor
-		return result
+		return result->keys()->map({_, v -> str2nr(v)})
 	endfunction
 
 	" Build parse tables
-	let actions = [] " Row for each state, column for each terminal
+	let actions = [] " Row for each state, column for each symbol
 	let goto = [] " Row for each state, column for each symbol
 
 	let i = 0
@@ -257,14 +258,11 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 			let A = item.production.lhs
 			if item.cursor != len(item.production.rhs) || A == -1 | continue | endif
 
-			let LA_set = range(a:num_non_terminals)->extend(LA(i, item.production)->keys()->map({_, v -> str2nr(v)}))
-			echom 'state: ' .. i .. ' LA_set: ' .. string(LA_set)
-			for s in LA_set
+			for s in LA(i, item.production)
 				let prev_action = actions[i][s]
-				" Automatically fix Shift-Reduce Conflicts by not reducing when it would cause a conflict
+				" Check for ambiguous grammar
 				if type(prev_action) != v:t_string || prev_action != 'error'
-					" continue
-					throw 'Conflict'
+					throw 'Shift/reduce or reduce/reduce conflict'
 				endif
 
 				let actions[i][s] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
