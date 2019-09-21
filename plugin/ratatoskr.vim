@@ -23,8 +23,9 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 
 	" Returns whether the specified symbol is nonterminal.
 	function! IsNonTerminal(symbol) abort closure
-		call assert_true(type(a:symbol) == v:t_number
-					\ && a:symbol >= 0 && a:symbol < a:num_symbols, 'Invalid symbol')
+		if type(a:symbol) != v:t_number || a:symbol < 0 || a:symbol >= a:num_symbols
+			throw 'Invalid symbol'
+		endif
 		return a:symbol < a:num_non_terminals " Nonterminal symbols are given the smaller id:s
 	endfunction
 	let IsTerminal = {symbol -> !IsNonTerminal(symbol)}
@@ -66,6 +67,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	let n = 0
 	while n < len(states)
 		let state = states[n]
+
 		for item in state.item_set
 			let x = item.production.rhs->get(item.cursor, -1) " Symbol to the right of dot
 			if x != -1
@@ -114,67 +116,126 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	endwhile
 	let IsNullable = {A -> nullable->has_key(A)}
 
-	" The set of nonterminal transitions of the LR(0) parser
-	let X = {} " TODO: Can this be made a List instead
+	let X = [] " The set of nonterminal transitions of the LR(0) parser
 	for i in range(len(states))
 		let state = states[i]
-		for transition_symbol in state.edges->keys()->filter({_, X -> IsNonTerminal(str2nr(X))})
-			let X[#{state: i, symbol: transition_symbol}] = 1
+		for transition_symbol in state.edges->keys()->map({_, v -> str2nr(v)})
+					\ ->filter({_, v -> IsNonTerminal(v)})
+			eval X->add(#{state: i, symbol: transition_symbol})
 		endfor
 	endfor
 
 	function ToSet(a) abort
 		let result = {}
-		for x in a | let result[a] = 1 | endfor
+		for x in a:a
+			if type(x) != v:t_string && type(x) != v:t_number | throw 'Bad type' | endif
+			let result[x] = 1
+		endfor
 		return result
 	endfunction
 
 	" Direct read symbols.
 	"
 	" Returns the terminals as the keys of a Dictionary.
-	let DR = {p, A -> states[states[p].edges[A]].edges->keys()->filter(IsTerminal)->ToSet()}
+	let DR = {p, A -> states[states[p].edges[A]].edges->keys()->filter({_, v -> IsTerminal(str2nr(v))})->ToSet()}
 
-	let Reads = {p, A -> states[p].edges[A] }
-	function! Reads(p, A) closure abort
-		let r = states[p].edges[A]
-		return states[r].edges->keys()->filter(IsNullable)
-					\ ->map({_, C -> #{state: r, symbol: C}})
+	" (p, A) READS (r, C) iff p --A-> r --C-> and C =>* eps
+	let reads = X->copy()->map({_, trans -> states[trans.state].edges[trans.symbol]})
+				\ ->map({_, r -> states[r].edges->keys()->filter({_, C -> IsNullable(C)})
+				\ 	->map({_, C -> X->index(#{state: r, symbol: str2nr(C)})})})
+	echomsg 'reads: ' .. string(reads)
+
+	" (p, A) INCLUDES (p', B) iff B -> L A T,  T =>* eps, and p' --L-> p
+	let includes = repeat([[]], len(X))
+	" (q, A -> w) LOOKBACK (p, A) iff p --w-> q
+	let lookback = []
+	function! CalcIncludesLookback() closure abort
+		for i in range(X->len())
+			let transition = X[i]
+			let state = states[transition.state]
+			let symbol = transition.symbol
+
+			for item in state.item_set
+				" Consider only start B-items
+				if item.production.lhs != symbol || item.cursor != 0 | continue | endif
+
+				let j = transition.state
+				for cursor in range(item.cursor, item.production.rhs->len() - 1)
+					let t = item.production.rhs[cursor]
+
+					if cursor != 0
+						" If this (symbol, state) is a nonterminal transition
+						let trans2 = X->index(#{state: j, symbol: t})
+						if trans2 != -1
+							let remainingNullable = range(cursor + 1, item.production.rhs->len() - 1)
+										\ ->map({_, v -> item.production.rhs[v]})
+										\ ->filter({_, v -> !has_key(nullable, v)})->empty()
+							if remainingNullable
+								eval includes[trans2]->add(i)
+							endif
+						endif
+					endif
+
+					let j = states[j].edges[t]
+				endfor
+
+				" Here we at end of item
+				eval lookback->add(#{q: j, production: item.production, transition: i})
+			endfor
+		endfor
 	endfunction
+	call CalcIncludesLookback()
+	echom 'includes: ' .. string(includes)
+	echom 'lookback: ' .. string(lookback)
 
 	" Digraph
 	function! Digraph(X, R, FP) abort
 		let stack = []
-		let F = a:X->copy()->map({_, _-> {}}) " Function from X to initially empty sets
-		" let N = range(len(a:X))->map(0)
-		let N = a:X->copy()->map(0)
+		let F = repeat([{}], len(a:X)) " Function from X to initially empty sets
+		let N = repeat([0], len(a:X))
 
-		function! Traverse(x) closure abort
-			eval stack->add(x)
+		function! Traverse(i, x) closure abort
+			eval stack->add(a:i)
 			let d = stack->len()
-			let N[x] = d
-			let F[x] = a:FP(x.state, x.symbol)
+			let N[a:i] = d
+			let F[a:i] = a:FP(a:x.state, a:x.symbol)
 
-			for y in R(x.state, x.symbol)
-				if N[y] == 0 | call Traverse(y) | endif
-				if N[y] < N[x] | let N[x] = N[y] | endif
-				eval F[x]->extend(F[y])
+			for j in a:R[i]
+				if N[j] == 0 | call Traverse(j, a:X[j]) | endif
+				if N[j] < N[a:i] | let N[a:i] = N[j] | endif
+				eval F[a:i]->extend(F[j])
 			endfor
 
-			if N[x] == d
+			if N[a:i] == d
 				while 1
 					let N[stack[-1]] = 1/0
-					let F[stack[-1]] = F[x]
-					if stack->remove(-1) is# x | break | endif
+					let F[stack[-1]] = F[a:i]
+					if stack->remove(-1) is# i | break | endif
 				endwhile
 			endif
 		endfunction
 
-		for x in a:X | if N[x] == 0 | call Traverse(x) | endif | endfor
+		for i in range(len(a:X)) | if N[i] == 0 | call Traverse(i, a:X[i]) | endif | endfor
 
 		return F
 	endfunction
 
-	let Read = Digraph(X, Reads, DR)
+	let Read = Digraph(X, reads, DR)
+	echom 'Read: ' .. string(Read)
+	let ReadFunc = {p, A -> Read[X->index(#{state: p, symbol: A})]}
+	let Follow = Digraph(X, includes, ReadFunc)
+	echom 'Follow: ' .. string(Follow)
+
+	" LA(q, A -> w) = U{Follow(p, A) | (q, A -> w) lookback (p, A)}
+	function! LA(q, production) closure abort
+		let result = {} " Start with empty set
+		for lb in lookback
+			if lb.q == a:q && lb.production == a:production
+				eval result->extend(Follow[lb.transition])
+			endif
+		endfor
+		return result
+	endfunction
 
 	" Build parse tables
 	let actions = [] " Row for each state, column for each terminal
@@ -196,10 +257,15 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 			let A = item.production.lhs
 			if item.cursor != len(item.production.rhs) || A == -1 | continue | endif
 
-			for s in range(a:num_symbols)
+			let LA_set = range(a:num_non_terminals)->extend(LA(i, item.production)->keys()->map({_, v -> str2nr(v)}))
+			echom 'state: ' .. i .. ' LA_set: ' .. string(LA_set)
+			for s in LA_set
 				let prev_action = actions[i][s]
 				" Automatically fix Shift-Reduce Conflicts by not reducing when it would cause a conflict
-				if type(prev_action) != v:t_string || prev_action != 'error' | continue | endif
+				if type(prev_action) != v:t_string || prev_action != 'error'
+					" continue
+					throw 'Conflict'
+				endif
 
 				let actions[i][s] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
 			endfor
@@ -217,7 +283,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	endfor
 
 	echomsg 'Actions'
-	echomsg 'State | ' .. string(terminals)
+	echomsg 'State | ' .. string(nonterminals) .. ' ' .. string(terminals)
 	for n in range(len(actions))
 		echomsg '' .. n .. ' | ' .. string(actions[n])
 	endfor
