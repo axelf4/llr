@@ -1,24 +1,26 @@
-" Incremental parser generator that compiles to VimL at runtime for
-" indentation, syntax highlighting, etc.
+" Incremental LALR(1) parser
 "
-" Then use `listener_add()` and the autocmd events BufReadPost and BufUnload
-"
-" See:
-" * https://pages.github-dev.cs.illinois.edu/cs421-haskell/web-su19/files/handouts/lr-parsing-tables.pdf
-" * https://dl.acm.org.sci-hub.tw/citation.cfm?id=357066
+" Based on:
+" - Wagner, Tim A., and Susan L. Graham. "Efficient and Flexible Incremental
+" Parsing." ACM Transactions on Programming Languages and Systems 20.2 (1998).
 
 scriptversion 3
 
-" Action bit masks. super non optimal
-" TODO add accept
-" Count on ~10x more productions than symbols
-" const [s:shift, s:reduce, s:error] = [0x8000, 0x4000, 0x2000]
-const s:error_sym = -1 " The builtin nonterminal error symbol.
-
-" Returns the parse tables for the specified LR(0) grammar.
+" Parse table constants.
 "
-" {grammar} is a List of the productions.
-function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
+" Parse table representation: table[num_symbols * state + la.symbol] =
+"     |18 bits for production| |14 bits for goto state|
+"     <- higher bits                      lower bits ->
+"
+" For reduce actions the production index is one-based, and thus zero for
+" shift actions. Since state zero is never the target of an edge, 0x0
+" indicates error.
+"
+" Accommodates approximately ten times more productions than states.
+const [s:error_action, s:accept_action, s:goto_mask, s:prod_mask, s:prod_sh] = [0x0, 0xFFFFFFFF, 0x3FFF, 0x3FFF->invert(), 0x4000]
+
+" Returns the parse table for the specified LALR(1) grammar.
+function! s:BuildTable(productions, num_non_terminals, num_symbols, eof) abort
 	let [nonterminals, terminals] = [range(a:num_non_terminals), range(a:num_non_terminals, a:num_symbols - 1)]
 
 	" Returns whether the specified symbol is nonterminal.
@@ -26,7 +28,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		if type(a:symbol) != v:t_number || a:symbol < 0 || a:symbol >= a:num_symbols
 			throw 'Invalid symbol'
 		endif
-		return a:symbol < a:num_non_terminals " Nonterminal symbols are given the smaller id:s
+		return a:symbol < a:num_non_terminals " Nonterminals are given smaller IDs
 	endfunction
 	let IsTerminal = {symbol -> !IsNonTerminal(symbol)}
 
@@ -41,7 +43,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 			let N = item.production.rhs->get(item.cursor, -1)
 			if N != -1 && IsNonTerminal(N)
 				" Add to the item set all initial items for the N-productions of the grammar, recursively
-				for production in a:grammar
+				for production in a:productions
 					if production.lhs isnot# N | continue | endif
 					let new_item = #{production: production, cursor: 0}
 					if a:item_set->index(new_item) == -1 | call add(a:item_set, new_item) | endif " Only add if unique
@@ -99,7 +101,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	let should_continue = 1
 	while should_continue
 		let should_continue = 0
-		for production in a:grammar
+		for production in a:productions
 			if nullable->has_key(production.lhs) | continue | endif
 			let is_nullable = 1
 			for X in production.rhs
@@ -153,43 +155,40 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 	let includes = repeat([[]], len(X))
 	" (q, A -> w) LOOKBACK (p, A) iff p --w-> q
 	let lookback = []
-	function! CalcIncludesLookback() closure abort
-		for i in range(X->len())
-			let transition = X[i]
-			let state = states[transition.state]
-			let B = transition.symbol
+	for i in range(X->len())
+		let transition = X[i]
+		let state = states[transition.state]
+		let B = transition.symbol
 
-			for item in state.item_set
-				" Consider only start B-items
-				if item.production.lhs != B || item.cursor != 0 | continue | endif
+		for item in state.item_set
+			" Consider only start B-items
+			if item.production.lhs != B || item.cursor != 0 | continue | endif
 
-				" Run the state machine forward
-				let j = transition.state
-				for cursor in range(item.cursor, item.production.rhs->len() - 1)
-					let t = item.production.rhs[cursor]
+			" Run the state machine forward
+			let j = transition.state
+			for cursor in range(item.cursor, item.production.rhs->len() - 1)
+				let t = item.production.rhs[cursor]
 
-					if cursor != 0
-						" If this (symbol, state) is a nonterminal transition
-						let trans2 = X->index(#{state: j, symbol: t})
-						if trans2 != -1
-							let remainingNullable = range(cursor + 1, item.production.rhs->len() - 1)
-										\ ->map({_, v -> item.production.rhs[v]})
-										\ ->filter({_, v -> !has_key(nullable, v)})->empty()
-							if remainingNullable
-								eval includes[trans2]->add(i)
-							endif
+				if cursor != 0
+					" If this (symbol, state) is a nonterminal transition
+					let trans2 = X->index(#{state: j, symbol: t})
+					if trans2 != -1
+						let remainingNullable = range(cursor + 1, item.production.rhs->len() - 1)
+									\ ->map({_, v -> item.production.rhs[v]})
+									\ ->filter({_, v -> !has_key(nullable, v)})->empty()
+						if remainingNullable
+							eval includes[trans2]->add(i)
 						endif
 					endif
+				endif
 
-					let j = states[j].edges[t]
-				endfor
-
-				" At this point j is the final state
-				eval lookback->add(#{q: j, production: item.production, transition: i})
+				let j = states[j].edges[t]
 			endfor
+
+			" At this point j is the final state
+			eval lookback->add(#{q: j, production: item.production, transition: i})
 		endfor
-	endfunction
-	call CalcIncludesLookback()
+	endfor
 
 	" Digraph
 	function! Digraph(X, R, FP) abort
@@ -211,7 +210,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 
 			if N[a:i] == d
 				while 1
-					let N[stack[-1]] = 1/0
+					let N[stack[-1]] = 1 / 0
 					let F[stack[-1]] = F[a:i]
 					if stack->remove(-1) is# i | break | endif
 				endwhile
@@ -238,18 +237,12 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		return result->keys()->map({_, v -> str2nr(v)})
 	endfunction
 
-	" Build parse tables
-	let actions = [] " Row for each state, column for each symbol
-	let goto = [] " Row for each state, column for each symbol
-
+	" Build parse table
+	let table = repeat([0], states->len() * a:num_symbols) " Row/col for each state resp. symbol
 	let i = 0
 	for state in states
-		call add(actions, map(range(a:num_symbols), '"error"'))
-		call add(goto, map(range(a:num_symbols), -1))
-
 		for [symbol, to] in state.edges->items()
-			let goto[i][symbol] = to " Goto to that state
-			let actions[i][symbol] = {'type': 'shift'}
+			let table[a:num_symbols * i + symbol] = to " Goto to that state
 		endfor
 
 		" Given a final A-item for production P (A != S') fill corresponding
@@ -259,20 +252,18 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 			if item.cursor != len(item.production.rhs) || A == -1 | continue | endif
 
 			for s in LA(i, item.production)
-				let prev_action = actions[i][s]
+				let prev_action = table[a:num_symbols * i + s]
 				" Check for ambiguous grammar
-				if type(prev_action) != v:t_string || prev_action != 'error'
-					throw 'Shift/reduce or reduce/reduce conflict'
-				endif
+				if prev_action | throw 'Shift/reduce or reduce/reduce conflict' | endif
 
-				let actions[i][s] = {'type': 'reduce', 'lhs': A, 'arity': len(item.production.rhs)}
+				let table[a:num_symbols * i + s] = (a:productions->index(item.production) + 1) * s:prod_sh " TODO
 			endfor
 		endfor
 
 		" For every item set containing S' → w•eof, set accept in eof column
 		for item in state.item_set
 			if item.production.lhs == -1 && item.production.rhs->get(item.cursor, -1) == a:eof
-				let actions[i][a:eof] = {'type': 'accept'}
+				let table[a:num_symbols * i + a:eof] = s:accept_action
 				break
 			endif
 		endfor
@@ -280,18 +271,7 @@ function! s:BuildTables(grammar, num_non_terminals, num_symbols, eof) abort
 		let i += 1
 	endfor
 
-	echomsg 'Actions'
-	echomsg 'State | ' .. string(nonterminals) .. ' ' .. string(terminals)
-	for n in range(len(actions))
-		echomsg '' .. n .. ' | ' .. string(actions[n])
-	endfor
-	echomsg 'Goto'
-	echomsg 'State | ' .. string(nonterminals) .. ' ' .. string(terminals)
-	for n in range(len(goto))
-		echomsg '' .. n .. ' | ' .. string(goto[n])
-	endfor
-
-	return #{actions: actions, goto: goto}
+	return table
 endfunction
 
 " Converts string names for symbols in the grammar to numerical ids.
@@ -312,13 +292,14 @@ function! s:ExtractSymbols(grammar) abort
 	for production in a:grammar
 		let production.lhs = ToId(production.lhs)
 	endfor
+	let error_sym = next_id | let next_id += 1
 	let num_non_terminals = next_id
 	for production in a:grammar
 		call map(production.rhs, {_, v -> ToId(v)})
 	endfor
 
 	let etoken = next_id | let eof = next_id + 1 | let num_symbols = next_id + 2
-	return [a:grammar, extracted_symbols, num_non_terminals, num_symbols, etoken, eof]
+	return [a:grammar, extracted_symbols, num_non_terminals, num_symbols, eof, error_sym, etoken]
 endfunction
 
 function! s:ReverseDict(dict) abort
@@ -330,15 +311,18 @@ function! s:ReverseDict(dict) abort
 endfunction
 
 " Constructs a language object from the specified grammar/regexes.
+"
+" The returned values `error_sym` and `etoken` are the nonterminal and
+" terminal error symbols, respectively.
 function! InitLanguage(grammar, regexes) abort
-	let [grammar, symbol_map, num_non_terminals, num_symbols, etoken, eof] = s:ExtractSymbols(a:grammar)
+	let [productions, symbol_map, num_non_terminals, num_symbols, eof, error_sym, etoken] = s:ExtractSymbols(a:grammar)
 	let num_terminals = num_symbols - num_non_terminals
 	let symbol_to_name = s:ReverseDict(symbol_map)
 	let symbol_to_name[eof] = '$'
 	let symbol_to_name[etoken] = "LEXERR"
-	let symbol_to_name[s:error_sym] = 'ERR'
+	let symbol_to_name[error_sym] = 'ERR'
 
-	let tables = s:BuildTables(grammar, num_non_terminals, num_symbols, eof)
+	let table = s:BuildTable(productions, num_non_terminals, num_symbols, eof)
 
 	" Build lexer regex pattern
 	if len(a:regexes) isnot num_terminals - 2 | throw 'Bad number of terminal regexes' | endif
@@ -387,8 +371,9 @@ function! InitLanguage(grammar, regexes) abort
 	endfunction
 
 	return #{
-				\ tables: tables, lexer: lexer,
-				\ num_non_terminals: num_non_terminals, eof: eof, etoken: etoken,
+				\ table: table, productions: productions, lexer: lexer,
+				\ num_symbols: num_symbols, num_non_terminals: num_non_terminals,
+				\ eof: eof, error_sym: error_sym, etoken: etoken,
 				\ symbol_to_name: symbol_to_name,
 				\ }
 endfunction
@@ -410,22 +395,22 @@ let s:regexes = {
 			\ 'i': '\s*\d\+\s*',
 			\ }
 
-let v:errors = []
 let lang = InitLanguage(s:grammar, s:regexes)
 
-function! s:IncParse(lang, node) abort
+" Incrementally re-parses the current buffer given the previous tree.
+function! s:Parse(lang, node) abort
 	let save_cursor = getcurpos()
 	try
 		call cursor(1, 1)
 
-		let actions = a:lang.tables.actions | let goto = a:lang.tables.goto
-		let num_non_terminals = a:lang.num_non_terminals
-		let eof = a:lang.eof | let etoken = a:lang.etoken
+		let table = a:lang.table | let productions = a:lang.productions
+		let num_symbols = a:lang.num_symbols | let num_non_terminals = a:lang.num_non_terminals
+		let eof = a:lang.eof | let error_sym = a:lang.error_sym | let etoken = a:lang.etoken
 		let IsTerminal = {symbol -> symbol >= num_non_terminals}
 
 		let lex = a:lang.lexer.new()
 		" Initialize the parse stack to contain only bos
-		let stack = #{stack: []} " Stores [beginning_state, node]
+		let stack = #{stack: []} " Stores pairs of [beginning_state, node]
 		function stack.push(node) abort closure
 			call extend(self.stack, [state, a:node])
 		endfunction
@@ -462,7 +447,7 @@ function! s:IncParse(lang, node) abort
 		" state.
 		function! Shift(node) abort closure
 			call stack.push(a:node)
-			let state = goto[state][a:node.symbol]
+			let state = table[num_symbols * state + a:node.symbol]->and(s:goto_mask)
 		endfunction
 
 		" Remove any subtrees on top of parse stack with null yield, then
@@ -484,11 +469,11 @@ function! s:IncParse(lang, node) abort
 			call Shift(node) " Leave final terminal symbol on top of stack
 		endfunction
 
-		let IsTransparent = {symbol -> symbol == s:error_sym || symbol == etoken}
+		let IsTransparent = {symbol -> symbol == error_sym || symbol == etoken}
 
-		function! Reduce(action) abort closure
-			let L = action.arity
-			let parent = #{symbol: action.lhs, length: 0} " TODO Reuse parent
+		function! Reduce(production) abort closure
+			let L = a:production.rhs->len()
+			let parent = #{symbol: a:production.lhs, length: 0} " TODO Reuse parent
 			let last_child = {}
 			while L > 0 || IsTransparent(stack.stack->get(-1, eos).symbol)
 				let child = stack.pop()
@@ -512,7 +497,7 @@ function! s:IncParse(lang, node) abort
 			let parent.modified = 0
 
 			call stack.push(parent)
-			let state = goto[state][action.lhs]
+			let state = table[num_symbols * state + a:production.lhs]->and(s:goto_mask)
 		endfunction
 
 		" Relex a continuous region of modified nodes.
@@ -568,10 +553,10 @@ function! s:IncParse(lang, node) abort
 				let stack_state = stack.stack[-2 * (1 + i)] | let stack_node = stack.stack[-2 * i - 1]
 				let i += 1
 				if IsTransparent(stack_node.symbol) | continue | endif
-				let action = actions[stack_state][la.symbol]
-				if !(type(action) == v:t_string && action == 'error')
+				let action = table[num_symbols * stack_state + la.symbol]
+				if action
 					" Pop stack nodes until can continue and wrap them in an error node
-					let error_node = #{symbol: s:error_sym, length: 0}
+					let error_node = #{symbol: error_sym, length: 0}
 					for node in range(i)->map({-> stack.pop()})
 						let node.parent = error_node
 						let error_node.length += node.length
@@ -591,7 +576,7 @@ function! s:IncParse(lang, node) abort
 
 			if la.symbol == eof
 				" Wrap everything in error node
-				let error_node = #{symbol: s:error_sym, length: 0}
+				let error_node = #{symbol: error_sym, length: 0}
 				let last_child = {}
 				while !(stack.stack->empty())
 					let child = stack.pop()
@@ -610,7 +595,7 @@ function! s:IncParse(lang, node) abort
 			endif
 
 			" Wrap lookahead in error node and push to stack
-			let error_node = #{symbol: s:error_sym, length: la.length, first_child: la}
+			let error_node = #{symbol: error_sym, length: la.length, first_child: la}
 			let la = PopLookahead(la) " Advance la before changing its parent/siblings!
 			let error_node.first_child.parent = error_node
 			if error_node.first_child->has_key('right_sibling') | unlet! error_node.first_child.right_sibling | endif
@@ -624,24 +609,23 @@ function! s:IncParse(lang, node) abort
 				continue
 			endif
 
-			let action = actions[state][la.symbol]
-			if type(action) != v:t_string && action.type == 'shift'
-				let verifying = !IsTerminal(la.symbol)
-				call Shift(la)
-				let offset += la.length
-				let la = PopLookahead(la)
-			elseif type(action) != v:t_string && action.type == 'reduce'
-				call Reduce(action)
-			elseif type(action) == v:t_string && action == 'error'
+			let action = table[num_symbols * state + la.symbol]
+			if !action " Error action
 				if IsTerminal(la.symbol)
 					if verifying
 						call RightBreakdown() " Delayed breakdown
 						let verifying = 0
 					else | call Recover() | endif " Actual parse error
 				else | let la = LeftBreakdown(la) | endif
-			elseif type(action) != v:t_string && action.type == 'accept' && stack.size() is 1
-						\ || Recover()
-				break
+			elseif action == s:accept_action " Accept action
+				if stack.size() is 1 || Recover() | break | endif
+			elseif action->and(s:prod_mask) == 0 " Shift action
+				let verifying = !IsTerminal(la.symbol)
+				call Shift(la)
+				let offset += la.length
+				let la = PopLookahead(la)
+			else " Reduce action
+				call Reduce(productions[action / s:prod_sh - 1])
 			endif
 		endwhile
 
@@ -703,7 +687,7 @@ function! s:Listener(bufnr, start, end, added, changes) abort
 				\ }
 
 	call s:EditRanges(b:node, edit) " Adjust node ranges
-	call IncParseBuffer()
+	call ParseBuffer() " Re-parse buffer
 endfunction
 
 function! ResetTree() abort
@@ -714,8 +698,8 @@ function! ResetTree() abort
 				\ modified: 1}
 endfunction
 
-function! IncParseBuffer() abort
-	let b:node = s:IncParse(g:lang, b:node)
+function! ParseBuffer() abort
+	let b:node = s:Parse(g:lang, b:node)
 	return b:node
 endfunction
 
@@ -760,5 +744,3 @@ function! PrintTree(node, depth) abort
 		call PrintTree(a:node.right_sibling, a:depth)
 	endif
 endfunction
-
-for error in v:errors | echoerr error | endfor
