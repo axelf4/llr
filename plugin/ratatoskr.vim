@@ -173,10 +173,9 @@ function! s:BuildTable(productions, num_non_terminals, num_symbols, eof) abort
 					" If this (symbol, state) is a nonterminal transition
 					let trans2 = X->index(#{state: j, symbol: t})
 					if trans2 != -1
-						let remainingNullable = range(cursor + 1, item.production.rhs->len() - 1)
-									\ ->map({_, v -> item.production.rhs[v]})
-									\ ->filter({_, v -> !has_key(nullable, v)})->empty()
-						if remainingNullable
+						let remainingNullable = item.production.rhs[cursor + 1:]
+									\ ->filter({_, v -> !has_key(nullable, v)})
+						if empty(remainingNullable)
 							eval includes[trans2]->add(i)
 						endif
 					endif
