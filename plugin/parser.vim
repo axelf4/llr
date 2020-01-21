@@ -1,8 +1,4 @@
 " Incremental LALR(1) parser
-"
-" Based on:
-" - Wagner, Tim A., and Susan L. Graham. "Efficient and Flexible Incremental
-" Parsing." ACM Transactions on Programming Languages and Systems 20.2 (1998).
 
 scriptversion 3
 
@@ -20,7 +16,7 @@ scriptversion 3
 const [s:error_action, s:accept_action, s:goto_mask, s:prod_mask, s:prod_sh] = [0x0, 0xFFFFFFFF, 0x3FFF, 0x3FFF->invert(), 0x4000]
 
 " Returns the parse table for the specified LALR(1) grammar.
-function! s:BuildTable(productions, num_non_terminals, num_symbols, eof) abort
+function s:BuildTable(productions, num_non_terminals, num_symbols, eof) abort
 	let [nonterminals, terminals] = [range(a:num_non_terminals), range(a:num_non_terminals, a:num_symbols - 1)]
 
 	" Returns whether the specified symbol is nonterminal.
@@ -276,7 +272,7 @@ endfunction
 " Converts string names for symbols in the grammar to numerical ids.
 "
 " Modifies the arguments in place.
-function! s:ExtractSymbols(grammar) abort
+function s:ExtractSymbols(grammar) abort
 	let extracted_symbols = {}
 	let next_id = 0
 	function ToId(x) abort closure
@@ -301,7 +297,7 @@ function! s:ExtractSymbols(grammar) abort
 	return [a:grammar, extracted_symbols, num_non_terminals, num_symbols, eof, error_sym, etoken]
 endfunction
 
-function! s:ReverseDict(dict) abort
+function s:ReverseDict(dict) abort
 	let result = {}
 	for [k, v] in items(a:dict)
 		let result[v] = k
@@ -313,7 +309,7 @@ endfunction
 "
 " The returned values `error_sym` and `etoken` are the nonterminal and
 " terminal error symbols, respectively.
-function! InitLanguage(grammar, regexes) abort
+function InitLanguage(grammar, regexes) abort
 	let [productions, symbol_map, num_non_terminals, num_symbols, eof, error_sym, etoken] = s:ExtractSymbols(a:grammar)
 	let num_terminals = num_symbols - num_non_terminals
 	let symbol_to_name = s:ReverseDict(symbol_map)
@@ -397,7 +393,11 @@ let s:regexes = {
 let lang = InitLanguage(s:grammar, s:regexes)
 
 " Incrementally re-parses the current buffer given the previous tree.
-function! s:Parse(lang, node) abort
+"
+" Based on:
+" - Wagner, Tim A., and Susan L. Graham. "Efficient and Flexible Incremental
+" Parsing." ACM Transactions on Programming Languages and Systems 20.2 (1998).
+function s:Parse(lang, node) abort
 	let save_cursor = getcurpos()
 	try
 		call cursor(1, 1)
@@ -636,7 +636,7 @@ endfunction
 "
 " Should be done before re-parsing. The edit must be entirely contained inside
 " node. {edit} may be modified in-place.
-function! s:EditRanges(node, edit) abort
+function s:EditRanges(node, edit) abort
 	let stack = [a:node, a:edit]
 
 	while !empty(stack)
@@ -671,7 +671,7 @@ function! s:EditRanges(node, edit) abort
 	endwhile
 endfunction
 
-function! s:Listener(bufnr, start, end, added, changes) abort
+function s:Listener(bufnr, start, end, added, changes) abort
 	if !exists('b:node') | return | endif
 
 	" Create appropriate edit structure
@@ -689,7 +689,7 @@ function! s:Listener(bufnr, start, end, added, changes) abort
 	call ParseBuffer() " Re-parse buffer
 endfunction
 
-function! ResetTree() abort
+function ResetTree() abort
 	if exists('b:listener_id') | call listener_remove(b:listener_id) | endif
 	let b:listener_id = listener_add(funcref('s:Listener'))
 
@@ -697,49 +697,7 @@ function! ResetTree() abort
 				\ modified: 1}
 endfunction
 
-function! ParseBuffer() abort
+function ParseBuffer() abort
 	let b:node = s:Parse(g:lang, b:node)
 	return b:node
-endfunction
-
-function! GetSyntaxNode(lnum, col) abort
-	let byte = line2byte(a:lnum) - 1 + a:col
-	let node = b:node
-	let stack = [node]
-	let offset = 0
-
-	while node->has_key('first_child')
-		" Output debug information
-		echomsg 'Top level: -------'
-		let child = node
-		while 1
-			echomsg 'Child: ' .. g:lang.symbol_to_name[child.symbol] .. ' len: ' .. child.length
-			if !has_key(child, 'right_sibling') | break | endif
-			let child = child.right_sibling
-		endwhile
-
-		let node = node.first_child
-		while offset + node.length < byte
-			let offset += node.length
-			let node = node.right_sibling
-		endwhile
-		call add(stack, node)
-	endwhile
-
-	" return stack
-	return string(map(stack, {_, v -> g:lang.symbol_to_name[v.symbol]})) .. ', modified: ' .. node->get('modified', 0) .. ', length: ' .. node.length
-endfunction
-
-function! GetSyntaxNodeUnderCursor() abort
-	return GetSyntaxNode(line('.'), col('.'))
-endfunction
-
-function! PrintTree(node, depth) abort
-	echom repeat(' ', 4 * a:depth) .. g:lang.symbol_to_name[a:node.symbol] .. a:node.length
-	if a:node->has_key('first_child')
-		call PrintTree(a:node.first_child, a:depth + 1)
-	endif
-	if a:node->has_key('right_sibling')
-		call PrintTree(a:node.right_sibling, a:depth)
-	endif
 endfunction
