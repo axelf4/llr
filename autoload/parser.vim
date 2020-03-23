@@ -273,237 +273,232 @@ endfunction
 " - Wagner, Tim A., and Susan L. Graham. "Efficient and Flexible Incremental
 " Parsing." ACM Transactions on Programming Languages and Systems 20.2 (1998).
 function parser#Parse(lang, node) abort
-	let save_cursor = getcurpos() " TODO Don't
-	try
-		call cursor(1, 1)
+	let table = a:lang.table | let productions = a:lang.productions
+	let num_symbols = a:lang.num_symbols | let num_non_terminals = a:lang.num_non_terminals
+	let eof = a:lang.eof | let error_sym = a:lang.error_sym | let etoken = a:lang.etoken
+	let IsTerminal = {symbol -> symbol >= num_non_terminals}
 
-		let table = a:lang.table | let productions = a:lang.productions
-		let num_symbols = a:lang.num_symbols | let num_non_terminals = a:lang.num_non_terminals
-		let eof = a:lang.eof | let error_sym = a:lang.error_sym | let etoken = a:lang.etoken
-		let IsTerminal = {symbol -> symbol >= num_non_terminals}
+	let lex = a:lang.lexer
+	call lex.reset()
+	" Initialize the parse stack to contain only bos
+	let stack = #{stack: []} " Stores pairs of [beginning_state, node]
+	function stack.push(node) abort closure
+		call extend(self.stack, [state, a:node])
+	endfunction
+	function stack.pop() abort closure
+		let [state, node] = remove(self.stack, -2, -1)
+		return node
+	endfunction
+	function stack.size() abort
+		return self.stack->len() / 2
+	endfunction
+	function stack.is_empty() abort
+		return self.stack->empty()
+	endfunction
+	let eos = #{symbol: a:lang.eof, length: 0}
+	let state = 0 | let la = a:node " Set lookahead to root of tree
+	let verifying = 0
+	let offset = 0 " Byte offset for lexing
 
-		let lex = a:lang.lexer
-		call lex.reset()
-		" Initialize the parse stack to contain only bos
-		let stack = #{stack: []} " Stores pairs of [beginning_state, node]
-		function stack.push(node) abort closure
-			call extend(self.stack, [state, a:node])
-		endfunction
-		function stack.pop() abort closure
-			let [state, node] = remove(self.stack, -2, -1)
-			return node
-		endfunction
-		function stack.size() abort
-			return self.stack->len() / 2
-		endfunction
-		function stack.is_empty() abort
-			return self.stack->empty()
-		endfunction
-		let eos = #{symbol: a:lang.eof, length: 0}
-		let state = 0 | let la = a:node " Set lookahead to root of tree
-		let verifying = 0
-		let offset = 0 " Byte offset for lexing
+	" Decompose a nonterminal lookahead.
+	function! LeftBreakdown(la) abort closure
+		return a:la->has_key('first_child') ? a:la.first_child : PopLookahead(a:la)
+	endfunction
+	" Pop right stack by traversing previous tree structure.
+	function! PopLookahead(la) abort closure
+		let node = a:la
+		while !has_key(node, 'right_sibling')
+			if !has_key(node, 'parent') | return eos | endif
+			let node = node.parent
+		endwhile
+		return node.right_sibling
+	endfunction
 
-		" Decompose a nonterminal lookahead.
-		function! LeftBreakdown(la) abort closure
-			return a:la->has_key('first_child') ? a:la.first_child : PopLookahead(a:la)
-		endfunction
-		" Pop right stack by traversing previous tree structure.
-		function! PopLookahead(la) abort closure
-			let node = a:la
-			while !has_key(node, 'right_sibling')
-				if !has_key(node, 'parent') | return eos | endif
-				let node = node.parent
-			endwhile
-			return node.right_sibling
-		endfunction
+	" Shift a node onto the parse stack and update the current parse
+	" state.
+	function! Shift(node) abort closure
+		call stack.push(a:node)
+		let state = table[num_symbols * state + a:node.symbol]->and(s:goto_mask)
+	endfunction
 
-		" Shift a node onto the parse stack and update the current parse
-		" state.
-		function! Shift(node) abort closure
-			call stack.push(a:node)
-			let state = table[num_symbols * state + a:node.symbol]->and(s:goto_mask)
-		endfunction
+	" Remove any subtrees on top of parse stack with null yield, then
+	" break down right edge of topmost subtree.
+	function! RightBreakdown() abort closure
+		while 1 " Replace top of stack with its children
+			let node = stack.pop()
+			" Does nothing when node is a terminal symbol
+			if node->has_key('first_child')
+				let child = node.first_child
+				while 1
+					call Shift(child)
+					if !has_key(child, 'right_sibling') | break | endif
+					let child = child.right_sibling
+				endwhile
+			endif
+			if IsTerminal(node.symbol) | break | endif
+		endwhile
+		call Shift(node) " Leave final terminal symbol on top of stack
+	endfunction
 
-		" Remove any subtrees on top of parse stack with null yield, then
-		" break down right edge of topmost subtree.
-		function! RightBreakdown() abort closure
-			while 1 " Replace top of stack with its children
-				let node = stack.pop()
-				" Does nothing when node is a terminal symbol
-				if node->has_key('first_child')
-					let child = node.first_child
-					while 1
-						call Shift(child)
-						if !has_key(child, 'right_sibling') | break | endif
-						let child = child.right_sibling
-					endwhile
+	let IsTransparent = {symbol -> symbol == error_sym || symbol == etoken}
+
+	function! Reduce(production) abort closure
+		let L = a:production.rhs->len()
+		let parent = #{symbol: a:production.lhs, length: 0} " TODO Reuse parent
+		let last_child = {}
+		while L > 0 || IsTransparent(stack.stack->get(-1, eos).symbol)
+			let child = stack.pop()
+			if !IsTransparent(child.symbol)
+				let L -= 1
+			endif
+			let child.parent = parent
+			let parent.length += child.length
+			if last_child != {}
+				let child.right_sibling = last_child
+			else
+				if child->has_key('right_sibling') | unlet! child.right_sibling | endif
+				if child->has_key('parent')
+					if child.parent->has_key('parent') | let parent.parent = child.parent.parent | endif
+					if child.parent->has_key('right_sibling') | let parent.parent = child.parent.right_sibling | endif
 				endif
-				if IsTerminal(node.symbol) | break | endif
+			endif
+			let last_child = child
+		endwhile
+		let parent.first_child = child
+		let parent.modified = 0
+
+		call stack.push(parent)
+		let state = table[num_symbols * state + a:production.lhs]->and(s:goto_mask)
+	endfunction
+
+	" Relex a continuous region of modified nodes.
+	function! Relex() abort closure
+		let cur = lex.set_offset(offset)
+		let node = la
+		let diff = 0 " Cursor offset to start of the current lookahead
+		let need_new_node = 0
+		let first = 1
+
+		while 1
+			let [symbol, length] = lex.advance()
+			let diff += length
+
+			while 1
+				if !need_new_node
+					if symbol == node.symbol || diff < node.length || node.symbol == eof
+						break
+					endif
+					let diff -= node.length
+				endif
+
+				" Drop overrun node by moving to the next terminal
+				let node = PopLookahead(node)
+				while !IsTerminal(node.symbol) | let node = LeftBreakdown(node) | endwhile
+				let need_new_node = 0
 			endwhile
-			call Shift(node) " Leave final terminal symbol on top of stack
-		endfunction
 
-		let IsTransparent = {symbol -> symbol == error_sym || symbol == etoken}
+			if symbol == eof
+				let new_node = eos
+			elseif symbol == node.symbol " If node reuse is possible
+				let diff -= node.length
+				let node.length = length | let node.modified = 0
+				let need_new_node = 1
+				let new_node = node
+			else
+				let new_node = #{symbol: symbol, length: length, right_sibling: node}
+				if node->has_key('parent') | let new_node.parent = node.parent | endif
+			endif
+			if first | let la = new_node | else | let prev.right_sibling = new_node | endif
 
-		function! Reduce(production) abort closure
-			let L = a:production.rhs->len()
-			let parent = #{symbol: a:production.lhs, length: 0} " TODO Reuse parent
+			if diff == 0 | break | endif " If synced up, break
+			let first = 0 | let prev = new_node
+		endwhile
+	endfunction
+
+	" Simple panic mode error recovery.
+	"
+	" Returns a truthy value if should accept.
+	function! Recover() abort closure
+		let i = 0
+		while i < stack.size()
+			let stack_state = stack.stack[-2 * (1 + i)] | let stack_node = stack.stack[-2 * i - 1]
+			let i += 1
+			if IsTransparent(stack_node.symbol) | continue | endif
+			let action = table[num_symbols * stack_state + la.symbol]
+			if action
+				" Pop stack nodes until can continue and wrap them in an error node
+				let error_node = #{symbol: error_sym, length: 0}
+				for node in range(i)->map({-> stack.pop()})
+					let node.parent = error_node
+					let error_node.length += node.length
+					let error_node.first_child = node
+
+					if exists('last_child')
+						let node.right_sibling = last_child
+					else
+						if node->has_key('right_sibling') | unlet! node.right_sibling | endif
+					endif
+					let last_child = node
+				endfor
+				call stack.push(error_node)
+				return
+			endif
+		endwhile
+
+		if la.symbol == eof
+			" Wrap everything in error node
+			let error_node = #{symbol: error_sym, length: 0}
 			let last_child = {}
-			while L > 0 || IsTransparent(stack.stack->get(-1, eos).symbol)
+			while !(stack.stack->empty())
 				let child = stack.pop()
-				if !IsTransparent(child.symbol)
-					let L -= 1
-				endif
-				let child.parent = parent
-				let parent.length += child.length
+				let child.parent = error_node
+				let error_node.length += child.length
 				if last_child != {}
 					let child.right_sibling = last_child
 				else
 					if child->has_key('right_sibling') | unlet! child.right_sibling | endif
-					if child->has_key('parent')
-						if child.parent->has_key('parent') | let parent.parent = child.parent.parent | endif
-						if child.parent->has_key('right_sibling') | let parent.parent = child.parent.right_sibling | endif
-					endif
 				endif
 				let last_child = child
 			endwhile
-			let parent.first_child = child
-			let parent.modified = 0
-
-			call stack.push(parent)
-			let state = table[num_symbols * state + a:production.lhs]->and(s:goto_mask)
-		endfunction
-
-		" Relex a continuous region of modified nodes.
-		function! Relex() abort closure
-			let cur = lex.set_offset(offset)
-			let node = la
-			let diff = 0 " Cursor offset to start of the current lookahead
-			let need_new_node = 0
-			let first = 1
-
-			while 1
-				let [symbol, length] = lex.advance()
-				let diff += length
-
-				while 1
-					if !need_new_node
-						if symbol == node.symbol || diff < node.length || node.symbol == eof
-							break
-						endif
-						let diff -= node.length
-					endif
-
-					" Drop overrun node by moving to the next terminal
-					let node = PopLookahead(node)
-					while !IsTerminal(node.symbol) | let node = LeftBreakdown(node) | endwhile
-					let need_new_node = 0
-				endwhile
-
-				if symbol == eof
-					let new_node = eos
-				elseif symbol == node.symbol " If node reuse is possible
-					let diff -= node.length
-					let node.length = length | let node.modified = 0
-					let need_new_node = 1
-					let new_node = node
-				else
-					let new_node = #{symbol: symbol, length: length, right_sibling: node}
-					if node->has_key('parent') | let new_node.parent = node.parent | endif
-				endif
-				if first | let la = new_node | else | let prev.right_sibling = new_node | endif
-
-				if diff == 0 | break | endif " If synced up, break
-				let first = 0 | let prev = new_node
-			endwhile
-		endfunction
-
-		" Simple panic mode error recovery.
-		"
-		" Returns a truthy value if should accept.
-		function! Recover() abort closure
-			let i = 0
-			while i < stack.size()
-				let stack_state = stack.stack[-2 * (1 + i)] | let stack_node = stack.stack[-2 * i - 1]
-				let i += 1
-				if IsTransparent(stack_node.symbol) | continue | endif
-				let action = table[num_symbols * stack_state + la.symbol]
-				if action
-					" Pop stack nodes until can continue and wrap them in an error node
-					let error_node = #{symbol: error_sym, length: 0}
-					for node in range(i)->map({-> stack.pop()})
-						let node.parent = error_node
-						let error_node.length += node.length
-						let error_node.first_child = node
-
-						if exists('last_child')
-							let node.right_sibling = last_child
-						else
-							if node->has_key('right_sibling') | unlet! node.right_sibling | endif
-						endif
-						let last_child = node
-					endfor
-					call stack.push(error_node)
-					return
-				endif
-			endwhile
-
-			if la.symbol == eof
-				" Wrap everything in error node
-				let error_node = #{symbol: error_sym, length: 0}
-				let last_child = {}
-				while !(stack.stack->empty())
-					let child = stack.pop()
-					let child.parent = error_node
-					let error_node.length += child.length
-					if last_child != {}
-						let child.right_sibling = last_child
-					else
-						if child->has_key('right_sibling') | unlet! child.right_sibling | endif
-					endif
-					let last_child = child
-				endwhile
-				if exists('child') | let error_node.first_child = child | endif
-				call stack.push(error_node)
-				return 1
-			endif
-
-			" Wrap lookahead in error node and push to stack
-			let error_node = #{symbol: error_sym, length: la.length, first_child: la}
-			let la = PopLookahead(la) " Advance la before changing its parent/siblings!
-			let error_node.first_child.parent = error_node
-			if error_node.first_child->has_key('right_sibling') | unlet! error_node.first_child.right_sibling | endif
+			if exists('child') | let error_node.first_child = child | endif
 			call stack.push(error_node)
-		endfunction
+			return 1
+		endif
 
-		while 1
-			if la->get('modified', 0)
-				if IsTerminal(la.symbol) | call Relex()
-				else | let la = LeftBreakdown(la) | endif " Split at changed point
-				continue
-			endif
+		" Wrap lookahead in error node and push to stack
+		let error_node = #{symbol: error_sym, length: la.length, first_child: la}
+		let la = PopLookahead(la) " Advance la before changing its parent/siblings!
+		let error_node.first_child.parent = error_node
+		if error_node.first_child->has_key('right_sibling') | unlet! error_node.first_child.right_sibling | endif
+		call stack.push(error_node)
+	endfunction
 
-			let action = table[num_symbols * state + la.symbol]
-			if !action " Error action
-				if IsTerminal(la.symbol)
-					if verifying
-						call RightBreakdown() " Delayed breakdown
-						let verifying = 0
-					else | call Recover() | endif " Actual parse error
-				else | let la = LeftBreakdown(la) | endif
-			elseif action == s:accept_action " Accept action
-				if stack.size() is 1 || Recover() | break | endif
-			elseif action->and(s:prod_mask) == 0 " Shift action
-				let verifying = !IsTerminal(la.symbol)
-				call Shift(la)
-				let offset += la.length
-				let la = PopLookahead(la)
-			else " Reduce action
-				call Reduce(productions[action / s:prod_sh - 1])
-			endif
-		endwhile
+	while 1
+		if la->get('modified', 0)
+			if IsTerminal(la.symbol) | call Relex()
+			else | let la = LeftBreakdown(la) | endif " Split at changed point
+			continue
+		endif
 
-		return stack.pop()
-	finally | call setpos('.', save_cursor) | endtry
+		let action = table[num_symbols * state + la.symbol]
+		if !action " Error action
+			if IsTerminal(la.symbol)
+				if verifying
+					call RightBreakdown() " Delayed breakdown
+					let verifying = 0
+				else | call Recover() | endif " Actual parse error
+			else | let la = LeftBreakdown(la) | endif
+		elseif action == s:accept_action " Accept action
+			if stack.size() is 1 || Recover() | break | endif
+		elseif action->and(s:prod_mask) == 0 " Shift action
+			let verifying = !IsTerminal(la.symbol)
+			call Shift(la)
+			let offset += la.length
+			let la = PopLookahead(la)
+		else " Reduce action
+			call Reduce(productions[action / s:prod_sh - 1])
+		endif
+	endwhile
+
+	return stack.pop()
 endfunction
