@@ -1,6 +1,7 @@
-all: check
+all: check lint
 
-check:
-	$(foreach test,$(wildcard test/test_*.vim),vim --clean --not-a-term -u runtest.vim "$(test)")
+check: ; luarocks test
+
+lint: ; luacheck llr-dev-1.rockspec
 
 .PHONY: all check
