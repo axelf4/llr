@@ -5,11 +5,10 @@ local prototype = {
 		self.offset = offset
 	end,
 	advance = function(self)
-		if self.offset > self.text:len() then return self.eof, 0 end
-		for i, regex in ipairs(self.regexes) do
-			local s, e = self.text:find("^" .. regex, self.offset)
+		if self.offset > self.text:len() then return self.lang.eof, 0 end
+		for symbol, pattern in pairs(self.patterns) do
+			local s, e = self.text:find("^" .. pattern, self.offset)
 			if s then
-				local symbol = i + self.num_non_terminals
 				local len = e - s + 1
 				self.offset = self.offset + len
 				return symbol, len
@@ -17,16 +16,18 @@ local prototype = {
 		end
 		local len = self.text:len() - self.offset + 1
 		self.offset = self.text:len() + 1
-		return self.etoken, len
+		return self.lang.etoken, len
 	end,
 }
 
-function StringReLexer.new(regexes, num_non_terminals, eof, etoken)
+function StringReLexer.new(lang, regexes, text)
+	local patterns = {}
+	for symbol, pattern in pairs(regexes) do
+		patterns[lang.symbol_map[symbol]] = pattern
+	end
+
 	return setmetatable({
-		regexes = regexes, num_non_terminals = num_non_terminals,
-		eof = eof, etoken = etoken,
-		offset = 1,
-		text = "1+2",
+		lang = lang, patterns = patterns, text = text, offset = 1,
 	}, {
 		__index = prototype,
 	})

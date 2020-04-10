@@ -6,12 +6,13 @@ source = {
 }
 description = {
 	summary = "LR parser",
-	detailed = [[LR parser]],
+	detailed = [[Incremental LALR parser generator]],
 	homepage = "https://github.com/axelf4/llr",
 	maintainer = "Axel Forsman",
 	license = "MIT"
 }
 dependencies = {
+	"lua >= 5.1",
 	"luabitop ~= 1",
 	"fun ~= 1",
 	"penlight ~= 1",

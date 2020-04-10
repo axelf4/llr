@@ -4,7 +4,6 @@ local fun = require "fun"
 local iter = fun.iter
 
 local Set = require "set"
-local StringReLexer = require "lexer"
 
 local unpack = rawget(table, "unpack") or unpack
 local insert, remove = table.insert, table.remove
@@ -258,7 +257,7 @@ end
 -- Based on:
 -- - Wagner, Tim A., and Susan L. Graham. "Efficient and Flexible Incremental
 -- Parsing." ACM Transactions on Programming Languages and Systems 20.2 (1998).
-local function parse(lang, root)
+local function parse(lang, root, lexer)
 	local table, productions = lang.table, lang.productions
 	local num_symbols, num_non_terminals = lang.num_symbols, lang.num_non_terminals
 	local eof, error_sym, etoken = lang.eof, lang.error_sym, lang.etoken
@@ -280,8 +279,6 @@ local function parse(lang, root)
 		}
 	})
 	local verifying = 0
-
-	local lex = lang.lexer
 	local offset = 1 -- Byte offset of la
 
 	-- Pop right stack by traversing previous tree structure.
@@ -346,14 +343,14 @@ local function parse(lang, root)
 
 	-- Relex a continuous region of modified nodes.
 	local function relex()
-		lex:set_offset(offset)
+		lexer:set_offset(offset)
 		local node = la
 		local diff = 0 -- Cursor offset to start of the current lookahead
 		local need_new_node = false
 		local prev
 
 		repeat
-			local symbol, length = lex:advance()
+			local symbol, length = lexer:advance()
 			diff = diff + length
 
 			while true do
@@ -480,7 +477,7 @@ local function adjust_len(node, edit)
 			adjust_len(child, {
 				start = edit.start,
 				old_end = math.max(edit.old_end, child.length),
-				new_end = edit.new_end, -- TODO
+				new_end = edit.new_end,
 			})
 			edit.new_end = 0 -- Distribute all new len to first child
 		else
@@ -524,30 +521,23 @@ local function reverse_table(table)
 	return result
 end
 
-local function init_lang(grammar, regexes)
+local function init_lang(grammar)
 	local productions, symbol_map, num_non_terminals, num_symbols, eof, error_sym, etoken = extract_symbols(grammar)
-
 	local symbol_names = reverse_table(symbol_map)
 
 	local table = build_table(productions, num_symbols, num_non_terminals, eof)
-
-	local patterns = {}
-	for symbol, pattern in pairs(regexes) do
-		patterns[symbol_map[symbol] - num_non_terminals] = pattern
-	end
-	local lexer = StringReLexer.new(patterns, num_non_terminals, eof, etoken)
 
 	return {
 		table = table, productions = productions,
 		num_symbols = num_symbols, num_non_terminals = num_non_terminals,
 		eof = eof, error_sym = error_sym, etoken = etoken,
-		lexer = lexer,
-		symbol_names = symbol_names,
+		symbol_map = symbol_map, symbol_names = symbol_names,
 	}
 end
 
 return {
 	build_table = build_table,
 	parse = parse,
+	adjust_len = adjust_len,
 	init_lang = init_lang,
 }
