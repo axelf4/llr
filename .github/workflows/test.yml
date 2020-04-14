@@ -1,0 +1,28 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        luaVersion: ["5.2", "luajit"]
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v5
+        with:
+          luaVersion: ${{ matrix.luaVersion }}
+      - name: Setup LuaRocks
+        uses: leafo/gh-actions-luarocks@v2
+      - name: Run tests
+        run: |
+          luarocks install --only-deps llr-dev-1.rockspec
+          luarocks test && luacov
+      - name: Upload coverage
+        uses: codecov/codecov-action@v1
+      - name: Run Luacheck
+        run: luacheck llr-dev-1.rockspec
